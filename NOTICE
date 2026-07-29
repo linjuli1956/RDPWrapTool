@@ -1,0 +1,18 @@
+RDPWrapTool
+Copyright 2026 linjuli1956
+
+This product contains software derived from RDP Wrapper:
+Copyright 2014 Stas'M Corp.
+Licensed under the Apache License, Version 2.0.
+Upstream: https://github.com/stascorp/rdpwrap
+
+It also contains wrapper modifications attributed in the source to:
+Copyright 2021 anhkgg.
+Upstream: https://github.com/anhkgg/SuperRDP
+
+Files derived from upstream retain their original copyright and license
+headers. RDPWrapTool contains subsequent modifications and additional code.
+
+The portable release includes Microsoft .NET Runtime components under the
+license and third-party notices shipped in app/dotnet/LICENSE.txt and
+app/dotnet/ThirdPartyNotices.txt.

@@ -1,0 +1,22 @@
+# Build output
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+
+# Portable runtime and release artifacts
+app/
+dist/
+
+# Local diagnostics and backups
+*.log
+*.bak
+*.tmp
+*.dmp
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
