@@ -1,10 +1,14 @@
-using System;
-using System.Drawing;
+﻿using System;
 using System.Windows.Forms;
 using RDPWrapTool.Core;
 
 namespace RDPWrapTool.Forms;
 
+/// <summary>
+/// RDPWrap Tool main window. This partial holds all behavior; the visual
+/// layout lives in MainForm.Designer.cs. Logic is unchanged from the original
+/// release, only the presentation was refactored into the Designer file.
+/// </summary>
 public partial class MainForm : Form
 {
     private static readonly string AppVersion =
@@ -16,47 +20,6 @@ public partial class MainForm : Form
     private readonly IniManager _iniManager = new();
     private OnlineUpdater? _onlineUpdater;
     private readonly TermSrvAnalyzer _analyzer = new();
-
-    // Main layout
-    private TabControl _tabControl = null!;
-
-    // ===== Home Tab =====
-    private TextBox _statusBox = null!;
-    private Button _installBtn = null!;
-    private Button _uninstallBtn = null!;
-    private Button _restartSvcBtn = null!;
-    private RichTextBox _homeLog = null!;
-
-    // ===== Users Tab =====
-    private TextBox _usernameTxt = null!;
-    private TextBox _passwordTxt = null!;
-    private TextBox _confirmPwdTxt = null!;
-    private TextBox _fullnameTxt = null!;
-    private Button _createUserBtn = null!;
-    private ListBox _allUsersList = null!;
-    private ListBox _rdpUsersList = null!;
-    private Button _refreshUsersBtn = null!;
-    private Button _addToRdpBtn = null!;
-    private Button _removeFromRdpBtn = null!;
-    private Button _deleteUserBtn = null!;
-    private Button _changePwdBtn = null!;
-
-    // ===== INI Tab =====
-    private RichTextBox _iniEditor = null!;
-    private Button _loadIniBtn = null!;
-    private Button _saveIniBtn = null!;
-    private Button _importIniBtn = null!;
-    private Button _onlineUpdateBtn = null!;
-    private TextBox _urlTxt = null!;
-    private Button _downloadUrlBtn = null!;
-    private Label _iniPathLabel = null!;
-
-    // ===== Analyze Tab =====
-    private Label _termsrvVerLabel = null!;
-    private Button _analyzeBtn = null!;
-    private RichTextBox _analysisReport = null!;
-    private RichTextBox _generatedIni = null!;
-    private Button _addToIniBtn = null!;
 
     public MainForm()
     {
@@ -70,9 +33,6 @@ public partial class MainForm : Form
         _analyzer.OnLog += msg => AppendLog(_analysisReport, msg);
         ServiceManager.OnLog += msg => AppendLog(_homeLog, msg);
         _onlineUpdater!.OnLog += msg => AppendLog(_homeLog, msg);
-
-        _tabControl.SelectedIndexChanged += (s, e) => OnTabChanged();
-        Load += MainForm_Load;
     }
 
     private void OnTabChanged()
@@ -102,284 +62,6 @@ public partial class MainForm : Form
     {
         RefreshStatus();
     }
-
-    #region Form Initialization
-
-    private void InitializeComponent()
-    {
-        Text = $"RDPWrap Tool v{AppVersion} - 多用户远程桌面工具";
-        Size = new Size(900, 650);
-        MinimumSize = new Size(800, 550);
-        StartPosition = FormStartPosition.CenterScreen;
-        Font = new Font("Microsoft YaHei UI", 9F);
-
-        _tabControl = new TabControl { Dock = DockStyle.Fill };
-
-        CreateHomeTab();
-        CreateUsersTab();
-        CreateIniTab();
-        CreateAnalyzeTab();
-
-        Controls.Add(_tabControl);
-    }
-
-    private void CreateHomeTab()
-    {
-        var tab = new TabPage("主页");
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3 };
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 300));
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 200));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
-        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-        // Status group
-        var statusGroup = new GroupBox { Text = "系统状态", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        _statusBox = new TextBox
-        {
-            Dock = DockStyle.Fill,
-            Multiline = true,
-            ReadOnly = true,
-            ScrollBars = ScrollBars.Vertical,
-            Font = new Font("Consolas", 9F)
-        };
-        statusGroup.Controls.Add(_statusBox);
-        panel.Controls.Add(statusGroup, 0, 0);
-
-        // Actions group
-        var actionGroup = new GroupBox { Text = "操作", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        var actionLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1 };
-        actionLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-        actionLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33));
-        actionLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 34));
-
-        _installBtn = new Button { Text = "安装 RDPWrap", Dock = DockStyle.Fill, Margin = new Padding(3) };
-        _installBtn.Click += (s, e) => InstallRdpWrap();
-
-        _uninstallBtn = new Button { Text = "卸载 RDPWrap", Dock = DockStyle.Fill, Margin = new Padding(3) };
-        _uninstallBtn.Click += (s, e) => UninstallRdpWrap();
-
-        _restartSvcBtn = new Button { Text = "重启远程服务", Dock = DockStyle.Fill, Margin = new Padding(3) };
-        _restartSvcBtn.Click += (s, e) => RestartService();
-
-        actionLayout.Controls.Add(_installBtn, 0, 0);
-        actionLayout.Controls.Add(_uninstallBtn, 1, 0);
-        actionLayout.Controls.Add(_restartSvcBtn, 2, 0);
-        actionGroup.Controls.Add(actionLayout);
-        panel.Controls.Add(actionGroup, 0, 1);
-
-        // Log
-        var logGroup = new GroupBox { Text = "操作日志", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        _homeLog = new RichTextBox
-        {
-            Dock = DockStyle.Fill,
-            ReadOnly = true,
-            Font = new Font("Consolas", 9F),
-            BackColor = Color.FromArgb(30, 30, 30),
-            ForeColor = Color.FromArgb(220, 220, 220)
-        };
-        logGroup.Controls.Add(_homeLog);
-        panel.Controls.Add(logGroup, 0, 2);
-        panel.SetColumnSpan(logGroup, 2);
-        panel.SetColumnSpan(actionGroup, 2);
-
-        tab.Controls.Add(panel);
-        _tabControl.TabPages.Add(tab);
-    }
-
-    private void CreateUsersTab()
-    {
-        var tab = new TabPage("用户管理");
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 350));
-        panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-
-        // Left: Create user
-        var createGroup = new GroupBox { Text = "新建用户", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        var createLayout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 6 };
-        createLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 90));
-        createLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int i = 0; i < 6; i++)
-            createLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        createLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-        createLayout.Controls.Add(new Label { Text = "用户名:", TextAlign = ContentAlignment.MiddleLeft }, 0, 0);
-        _usernameTxt = new TextBox { Dock = DockStyle.Fill };
-        createLayout.Controls.Add(_usernameTxt, 1, 0);
-
-        createLayout.Controls.Add(new Label { Text = "密码:", TextAlign = ContentAlignment.MiddleLeft }, 0, 1);
-        _passwordTxt = new TextBox { Dock = DockStyle.Fill, UseSystemPasswordChar = true };
-        createLayout.Controls.Add(_passwordTxt, 1, 1);
-
-        createLayout.Controls.Add(new Label { Text = "确认密码:", TextAlign = ContentAlignment.MiddleLeft }, 0, 2);
-        _confirmPwdTxt = new TextBox { Dock = DockStyle.Fill, UseSystemPasswordChar = true };
-        createLayout.Controls.Add(_confirmPwdTxt, 1, 2);
-
-        createLayout.Controls.Add(new Label { Text = "全名(可选):", TextAlign = ContentAlignment.MiddleLeft }, 0, 3);
-        _fullnameTxt = new TextBox { Dock = DockStyle.Fill };
-        createLayout.Controls.Add(_fullnameTxt, 1, 3);
-
-        _createUserBtn = new Button { Text = "创建用户并加入RDP组", Dock = DockStyle.Fill, Margin = new Padding(3) };
-        _createUserBtn.Click += (s, e) => CreateUser();
-        createLayout.Controls.Add(_createUserBtn, 0, 4);
-        createLayout.SetColumnSpan(_createUserBtn, 2);
-
-        _changePwdBtn = new Button { Text = "修改选中用户密码", Dock = DockStyle.Fill, Margin = new Padding(3) };
-        _changePwdBtn.Click += (s, e) => ChangePassword();
-        createLayout.Controls.Add(_changePwdBtn, 0, 5);
-        createLayout.SetColumnSpan(_changePwdBtn, 2);
-
-        createGroup.Controls.Add(createLayout);
-        panel.Controls.Add(createGroup, 0, 0);
-
-        // Right: User lists
-        var listPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3 };
-        listPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        listPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
-        listPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 30));
-        listPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-        listPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
-
-        _refreshUsersBtn = new Button { Text = "刷新用户列表", Dock = DockStyle.Fill };
-        _refreshUsersBtn.Click += (s, e) => RefreshUserLists();
-        listPanel.Controls.Add(_refreshUsersBtn, 0, 0);
-        listPanel.SetColumnSpan(_refreshUsersBtn, 2);
-
-        var allUsersGroup = new GroupBox { Text = "所有本地用户", Dock = DockStyle.Fill };
-        _allUsersList = new ListBox { Dock = DockStyle.Fill, Font = new Font("Consolas", 9F) };
-        allUsersGroup.Controls.Add(_allUsersList);
-        listPanel.Controls.Add(allUsersGroup, 0, 1);
-
-        var rdpUsersGroup = new GroupBox { Text = "远程桌面用户组", Dock = DockStyle.Fill };
-        _rdpUsersList = new ListBox { Dock = DockStyle.Fill, Font = new Font("Consolas", 9F) };
-        rdpUsersGroup.Controls.Add(_rdpUsersList);
-        listPanel.Controls.Add(rdpUsersGroup, 1, 1);
-
-        // Action buttons
-        var btnPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight };
-        _addToRdpBtn = new Button { Text = "加入RDP组", AutoSize = true, Margin = new Padding(3) };
-        _addToRdpBtn.Click += (s, e) => AddToRdpGroup();
-        _removeFromRdpBtn = new Button { Text = "移出RDP组", AutoSize = true, Margin = new Padding(3) };
-        _removeFromRdpBtn.Click += (s, e) => RemoveFromRdpGroup();
-        _deleteUserBtn = new Button { Text = "删除用户", AutoSize = true, Margin = new Padding(3), ForeColor = Color.Red };
-        _deleteUserBtn.Click += (s, e) => DeleteUser();
-        btnPanel.Controls.AddRange(new Control[] { _addToRdpBtn, _removeFromRdpBtn, _deleteUserBtn });
-        listPanel.Controls.Add(btnPanel, 0, 2);
-        listPanel.SetColumnSpan(btnPanel, 2);
-
-        panel.Controls.Add(listPanel, 1, 0);
-        tab.Controls.Add(panel);
-        _tabControl.TabPages.Add(tab);
-    }
-
-    private void CreateIniTab()
-    {
-        var tab = new TabPage("INI 配置");
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3 };
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 25));
-        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-
-        // Toolbar
-        var toolbar = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, Padding = new Padding(3) };
-        _loadIniBtn = new Button { Text = "加载", AutoSize = true, Margin = new Padding(3) };
-        _loadIniBtn.Click += (s, e) => LoadIni();
-        _saveIniBtn = new Button { Text = "保存", AutoSize = true, Margin = new Padding(3) };
-        _saveIniBtn.Click += (s, e) => SaveIni();
-        _importIniBtn = new Button { Text = "从文件导入", AutoSize = true, Margin = new Padding(3) };
-        _importIniBtn.Click += (s, e) => ImportIni();
-        _onlineUpdateBtn = new Button { Text = "在线更新(默认源)", AutoSize = true, Margin = new Padding(3) };
-        _onlineUpdateBtn.Click += async (s, e) => await OnlineUpdateDefault();
-
-        _urlTxt = new TextBox { Width = 250, Margin = new Padding(3), PlaceholderText = "自定义INI下载URL" };
-        _downloadUrlBtn = new Button { Text = "下载", AutoSize = true, Margin = new Padding(3) };
-        _downloadUrlBtn.Click += async (s, e) => await OnlineUpdateCustom();
-
-        toolbar.Controls.AddRange(new Control[] { _loadIniBtn, _saveIniBtn, _importIniBtn, _onlineUpdateBtn, _urlTxt, _downloadUrlBtn });
-        panel.Controls.Add(toolbar, 0, 0);
-
-        // Path label
-        _iniPathLabel = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Font = new Font("Consolas", 8F), ForeColor = Color.Gray };
-        panel.Controls.Add(_iniPathLabel, 0, 1);
-
-        // Editor
-        _iniEditor = new RichTextBox
-        {
-            Dock = DockStyle.Fill,
-            Font = new Font("Consolas", 9F),
-            BackColor = Color.FromArgb(250, 250, 250),
-            WordWrap = false,
-            ScrollBars = RichTextBoxScrollBars.Both
-        };
-        panel.Controls.Add(_iniEditor, 0, 2);
-
-        tab.Controls.Add(panel);
-        _tabControl.TabPages.Add(tab);
-    }
-
-    private void CreateAnalyzeTab()
-    {
-        var tab = new TabPage("自动分析");
-        var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4 };
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 60));
-        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 40));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 35));
-        panel.RowStyles.Add(new RowStyle(SizeType.Percent, 60));
-
-        // Top: info + button
-        var topPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1 };
-        topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 150));
-
-        _termsrvVerLabel = new Label
-        {
-            Dock = DockStyle.Fill,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Text = "termsrv.dll 版本: 检测中...",
-            Font = new Font("Microsoft YaHei UI", 10F)
-        };
-        _analyzeBtn = new Button { Text = "开始自动分析", Dock = DockStyle.Fill, Margin = new Padding(8) };
-        _analyzeBtn.Click += async (s, e) => await RunAnalysis();
-
-        topPanel.Controls.Add(_termsrvVerLabel, 0, 0);
-        topPanel.Controls.Add(_analyzeBtn, 1, 0);
-        panel.Controls.Add(topPanel, 0, 0);
-
-        // Analysis report
-        var reportGroup = new GroupBox { Text = "分析报告", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        _analysisReport = new RichTextBox
-        {
-            Dock = DockStyle.Fill,
-            ReadOnly = true,
-            Font = new Font("Consolas", 9F),
-            BackColor = Color.FromArgb(30, 30, 30),
-            ForeColor = Color.FromArgb(220, 220, 220)
-        };
-        reportGroup.Controls.Add(_analysisReport);
-        panel.Controls.Add(reportGroup, 0, 1);
-
-        // Add to INI button
-        _addToIniBtn = new Button { Text = "将分析结果添加到INI文件", Dock = DockStyle.Fill, Margin = new Padding(3) };
-        _addToIniBtn.Click += (s, e) => AddAnalysisToIni();
-        panel.Controls.Add(_addToIniBtn, 0, 2);
-
-        // Generated INI section
-        var iniGroup = new GroupBox { Text = "生成的INI配置 (可直接编辑后添加)", Dock = DockStyle.Fill, Padding = new Padding(8) };
-        _generatedIni = new RichTextBox
-        {
-            Dock = DockStyle.Fill,
-            Font = new Font("Consolas", 9F),
-            WordWrap = false,
-            ScrollBars = RichTextBoxScrollBars.Both
-        };
-        iniGroup.Controls.Add(_generatedIni);
-        panel.Controls.Add(iniGroup, 0, 3);
-
-        tab.Controls.Add(panel);
-        _tabControl.TabPages.Add(tab);
-    }
-
-    #endregion
 
     #region Home Tab Logic
 
@@ -411,6 +93,13 @@ public partial class MainForm : Form
         // Update analyze tab label
         if (_termsrvVerLabel != null)
             _termsrvVerLabel.Text = $"termsrv.dll 版本: {ver?.ToString() ?? "(未知)"}";
+
+        // Compact header status so the current state is always visible.
+        if (_statusHeaderLabel != null)
+        {
+            _statusHeaderLabel.Text =
+                $"termsrv {ver?.ToString() ?? "?"}  ·  RDPWrap {(_installer.IsInstalled ? "已安装" : "未安装")}  ·  INI {(supported ? "支持" : "不支持")}";
+        }
     }
 
     private void InstallRdpWrap()
