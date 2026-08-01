@@ -241,6 +241,30 @@ public class PEAnalyzer : IDisposable
     }
 
     /// <summary>
+    /// Find all occurrences of a pattern where null bytes are wildcards.
+    /// Unlike the 0xFF-wildcard overload, 0xFF here is a literal byte.
+    /// </summary>
+    public List<int> FindAllPatterns(byte?[] pattern, int startIndex, int searchLength)
+    {
+        var results = new List<int>();
+        int endIndex = Math.Min(startIndex + searchLength, _data.Length) - pattern.Length;
+        for (int i = startIndex; i <= endIndex; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < pattern.Length; j++)
+            {
+                if (pattern[j].HasValue && _data[i + j] != pattern[j].Value)
+                {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) results.Add(i);
+        }
+        return results;
+    }
+
+    /// <summary>
     /// Get the raw data for a section.
     /// </summary>
     public byte[] GetSectionData(PESection section)

@@ -33,8 +33,9 @@ public class RDPWrapInstaller
 
     public RDPWrapInstaller()
     {
+        AssetManager.EnsureAssets();
         _system32Dir = Environment.GetFolderPath(Environment.SpecialFolder.System);
-        _toolDir = AppContext.BaseDirectory;
+        _toolDir = AssetManager.ToolDataDir;
         Is64Bit = Environment.Is64BitOperatingSystem;
     }
 
@@ -233,13 +234,7 @@ public class RDPWrapInstaller
                 ServiceManager.DiagnoseTermServiceFailure();
             }
 
-            // Configure registry for RDP
-            Log("[*] Configuring Terminal Server registry...");
-            TSConfigRegistry(true);
-
-            // Configure firewall
-            Log("[*] Configuring firewall...");
-            TSConfigFirewall(true);
+            EnableRemoteDesktop();
 
             if (started)
             {
@@ -255,6 +250,115 @@ public class RDPWrapInstaller
         catch (Exception ex)
         {
             Log($"[-] Install error: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Deploy/update rdpwrap.dll and rdpwrap.ini to System32 without full install.
+    /// Use when RDPWrap is already installed and you just need to push updated files
+    /// (e.g. after auto-analysis added a new version section to the local INI).
+    /// Stops TermService, copies both files, ensures ServiceDll registry, restarts.
+    /// </summary>
+    public bool DeployFilesOnly()
+    {
+        string srcDll = Path.Combine(_toolDir, "rdpwrap.dll");
+        string srcIni = Path.Combine(_toolDir, "rdpwrap.ini");
+        string dstDll = Path.Combine(_system32Dir, "rdpwrap.dll");
+        string dstIni = Path.Combine(_system32Dir, "rdpwrap.ini");
+
+        if (!File.Exists(srcDll))
+        {
+            Log($"[-] rdpwrap.dll not found in tool directory: {srcDll}");
+            return false;
+        }
+        if (!File.Exists(srcIni))
+        {
+            Log($"[-] rdpwrap.ini not found in tool directory: {srcIni}");
+            return false;
+        }
+
+        try
+        {
+            Log("[*] 正在停止 TermService...");
+            ServiceManager.StopService(ServiceManager.TermServiceName);
+            System.Threading.Thread.Sleep(1000);
+
+            Log("[*] 正在部署 rdpwrap.dll 到 System32...");
+            File.Copy(srcDll, dstDll, true);
+            Log("[*] 正在部署 rdpwrap.ini 到 System32...");
+            File.Copy(srcIni, dstIni, true);
+
+            // Ensure ServiceDll registry points to rdpwrap.dll
+            Log("[*] 确认 ServiceDll 注册表...");
+            SetWrapperDll(dstDll);
+
+            Log("[*] 正在启动 TermService...");
+            bool started = ServiceManager.StartService(ServiceManager.TermServiceName);
+            if (!started)
+            {
+                Log("[-] TermService 启动失败！");
+                ServiceManager.DiagnoseTermServiceFailure();
+            }
+            else
+            {
+                Log("[+] 部署完成，TermService 已重启。");
+            }
+            return started;
+        }
+        catch (Exception ex)
+        {
+            Log($"[-] Deploy error: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Enable Windows Remote Desktop at the OS level.
+    /// This is separate from RDPWrap: Windows itself must allow RDP connections,
+    /// the firewall must allow TCP 3389, and TermService must be startable.
+    /// </summary>
+    public bool EnableRemoteDesktop()
+    {
+        try
+        {
+            Log("[*] 正在启用 Windows 远程桌面...");
+            TSConfigRegistry(true);
+            TSConfigFirewall(true);
+            ServiceManager.SetServiceStartType(ServiceManager.TermServiceName, System.ServiceProcess.ServiceStartMode.Manual);
+            ServiceManager.EnsureDependencies();
+
+            bool started = true;
+            if (ServiceManager.GetServiceStatus(ServiceManager.TermServiceName) != System.ServiceProcess.ServiceControllerStatus.Running)
+                started = ServiceManager.StartService(ServiceManager.TermServiceName);
+
+            if (started)
+            {
+                Log("[+] Windows 远程桌面已启用。");
+                return true;
+            }
+
+            Log("[!] Windows 远程桌面开关已启用，但 TermService 未能启动。");
+            ServiceManager.DiagnoseTermServiceFailure();
+            return false;
+        }
+        catch (Exception ex)
+        {
+            Log($"[-] 启用 Windows 远程桌面失败: {ex.Message}");
+            return false;
+        }
+    }
+
+    public static bool IsRemoteDesktopEnabled()
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(TerminalServerRegKey, false);
+            var value = key?.GetValue("fDenyTSConnections");
+            return value is int deny && deny == 0;
+        }
+        catch
+        {
             return false;
         }
     }
@@ -419,23 +523,32 @@ public class RDPWrapInstaller
     {
         try
         {
-            string args = enable
-                ? "advfirewall firewall add rule name=\"Remote Desktop\" dir=in protocol=tcp localport=3389 profile=any action=allow"
-                : "advfirewall firewall delete rule name=\"Remote Desktop\"";
-            var psi = new ProcessStartInfo
+            if (enable)
             {
-                FileName = "netsh.exe",
-                Arguments = args,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                Verb = "runas"
-            };
-            Process.Start(psi)?.WaitForExit(10000);
+                RunNetsh("advfirewall firewall set rule group=\"remote desktop\" new enable=Yes");
+                RunNetsh("advfirewall firewall add rule name=\"RDPWrapTool Remote Desktop 3389\" dir=in protocol=tcp localport=3389 profile=any action=allow");
+            }
+            else
+            {
+                RunNetsh("advfirewall firewall delete rule name=\"RDPWrapTool Remote Desktop 3389\"");
+            }
         }
         catch (Exception ex)
         {
             Log($"[-] Firewall config error: {ex.Message}");
         }
+    }
+
+    private static void RunNetsh(string args)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = "netsh.exe",
+            Arguments = args,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        Process.Start(psi)?.WaitForExit(10000);
     }
 
     private void DeleteFileWithRetry(string path)

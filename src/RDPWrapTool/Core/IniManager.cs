@@ -11,6 +11,20 @@ namespace RDPWrapTool.Core;
 /// </summary>
 public class IniManager
 {
+    /// <summary>Known patch code hex payloads. Auto-added to [PatchCodes] when a generated section needs them.</summary>
+    public static readonly Dictionary<string, string> KnownPatchCodes = new()
+    {
+        { "jmpshort", "EB" },
+        { "Zero", "00" },
+        { "nopjmp", "90E9" },
+        { "mov_eax_1_nop_2", "B8010000009090" },
+        { "CDefPolicy_Query_eax_rcx", "B80001000089813806000090" },
+        { "CDefPolicy_Query_eax_rcx_jmp", "B80001000089813806000090EB" },
+        { "CDefPolicy_Query_eax_rdi", "B80001000089873806000090" },
+        { "CDefPolicy_Query_eax_rdi_jmp", "B80001000089873806000090EB" },
+        { "CDefPolicy_Query_r9d_rdi_jmp", "C7873806000000010000EB" },
+    };
+
     private readonly string _toolDir;
     private string _iniPath;
 
@@ -21,8 +35,9 @@ public class IniManager
 
     public IniManager()
     {
-        _toolDir = AppContext.BaseDirectory;
-        _iniPath = Path.Combine(_toolDir, "rdpwrap.ini");
+        AssetManager.EnsureAssets();
+        _toolDir = AssetManager.ToolDataDir;
+        _iniPath = AssetManager.IniPath;
     }
 
     /// <summary>
@@ -47,13 +62,16 @@ public class IniManager
     }
 
     /// <summary>
-    /// Save text to the INI file.
+    /// Save text to the INI file. Normalizes line endings to CRLF, guarantees a
+    /// trailing CRLF (rdpwrap's parser drops the last line otherwise), and writes
+    /// UTF-8 WITHOUT BOM so the first line stays a clean comment.
     /// </summary>
     public bool SaveText(string text)
     {
         try
         {
-            File.WriteAllText(_iniPath, text, Encoding.UTF8);
+            text = NormalizeCrlf(text);
+            File.WriteAllText(_iniPath, text, new UTF8Encoding(false));
             Log($"[+] INI saved to: {_iniPath}");
             return true;
         }
@@ -62,6 +80,15 @@ public class IniManager
             Log($"[-] Save INI error: {ex.Message}");
             return false;
         }
+    }
+
+    /// <summary>Normalize to CRLF and ensure the file ends with CRLF.</summary>
+    public static string NormalizeCrlf(string text)
+    {
+        text = text.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\n", "\r\n");
+        if (!text.EndsWith("\r\n"))
+            text += "\r\n";
+        return text;
     }
 
     /// <summary>
@@ -105,7 +132,7 @@ public class IniManager
             if (!File.Exists(iniPath)) return false;
             var text = File.ReadAllText(iniPath, Encoding.UTF8);
             string sectionHeader = $"[{versionString}]";
-            return text.Contains(sectionHeader, StringComparison.OrdinalIgnoreCase);
+            return text.IndexOf(sectionHeader, StringComparison.OrdinalIgnoreCase) >= 0;
         }
         catch
         {
@@ -162,6 +189,87 @@ public class IniManager
             return (false, null);
         }
         return (CheckVersionSupported(ver), ver);
+    }
+
+    /// <summary>
+    /// Add or replace a version section (plus its -SLInit pair) for MULTIPLE alias
+    /// version names at once, and ensure required patch codes exist in [PatchCodes].
+    /// </summary>
+    public bool AddVersionSections(IReadOnlyList<string> aliases, string sectionContent, string? slInitContent, IEnumerable<string>? requiredPatchCodes = null)
+    {
+        try
+        {
+            var text = LoadText();
+            if (string.IsNullOrEmpty(text))
+            {
+                Log("[-] Cannot add sections: INI file is empty.");
+                return false;
+            }
+
+            text = EnsurePatchCodes(text, requiredPatchCodes);
+
+            foreach (var name in aliases)
+            {
+                text = RemoveSection(text, name);
+                text = RemoveSection(text, $"{name}-SLInit");
+            }
+
+            var sb = new StringBuilder(NormalizeCrlf(text));
+            for (int i = 0; i < aliases.Count; i++)
+            {
+                sb.AppendLine();
+                if (i > 0)
+                    sb.AppendLine("; alias section - same binary, alternate version resource value");
+                sb.AppendLine($"[{aliases[i]}]");
+                sb.AppendLine(sectionContent.TrimEnd());
+                if (!string.IsNullOrEmpty(slInitContent))
+                {
+                    sb.AppendLine();
+                    sb.AppendLine($"[{aliases[i]}-SLInit]");
+                    sb.AppendLine(slInitContent.TrimEnd());
+                }
+            }
+
+            return SaveText(sb.ToString());
+        }
+        catch (Exception ex)
+        {
+            Log($"[-] AddVersionSections error: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Append missing entries to the [PatchCodes] section.</summary>
+    public string EnsurePatchCodes(string text, IEnumerable<string>? requiredCodes)
+    {
+        if (requiredCodes == null) return text;
+        var missing = new List<KeyValuePair<string, string>>();
+        foreach (var code in requiredCodes.Distinct())
+        {
+            if (string.IsNullOrEmpty(code) || !KnownPatchCodes.TryGetValue(code, out var hex)) continue;
+            // code present if a line "code=..." exists anywhere
+            if (!System.Text.RegularExpressions.Regex.IsMatch(text, $"(?m)^\\s*{System.Text.RegularExpressions.Regex.Escape(code)}\\s*="))
+                missing.Add(new KeyValuePair<string, string>(code, hex));
+        }
+        if (missing.Count == 0) return text;
+
+        foreach (var kv in missing)
+            Log($"[+] adding patch code to [PatchCodes]: {kv.Key}");
+
+        var lines = NormalizeCrlf(text).Split(new[] { "\r\n" }, StringSplitOptions.None).ToList();
+        int idx = lines.FindIndex(l => l.Trim().Equals("[PatchCodes]", StringComparison.OrdinalIgnoreCase));
+        if (idx < 0)
+        {
+            // no PatchCodes section at all - create it at the end
+            lines.Add("");
+            lines.Add("[PatchCodes]");
+            idx = lines.Count - 1;
+        }
+        // insert right after the section header
+        int insertAt = idx + 1;
+        foreach (var kv in missing)
+            lines.Insert(insertAt++, $"{kv.Key}={kv.Value}");
+        return string.Join("\r\n", lines);
     }
 
     /// <summary>

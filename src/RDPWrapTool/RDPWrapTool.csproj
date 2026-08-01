@@ -1,45 +1,36 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
+    <!-- .NET Framework 4.8: inbox on Win10 1903+ / Win11 -> truly portable EXE (~1-3MB) -->
+    <TargetFramework>net48</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>RDPWrapTool</AssemblyName>
     <RootNamespace>RDPWrapTool</RootNamespace>
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
-    <InformationalVersion>1.0.0</InformationalVersion>
-  </PropertyGroup>
-
-  <!--
-    Framework-dependent deployment (SelfContained=false). The publish output
-    contains only the application assemblies (~1 MB) plus rdpwrap.dll/.ini and
-    relies on the .NET 8 Desktop Runtime installed on the target machine. This
-    replaces the previous self-contained build that shipped the full ~160 MB
-    runtime inside app/dotnet.
-  -->
-  <PropertyGroup>
-    <SelfContained>false</SelfContained>
-    <RuntimeIdentifier></RuntimeIdentifier>
-    <PublishReadyToRun>false</PublishReadyToRun>
-    <PublishTrimmed>false</PublishTrimmed>
-    <DebugType>embedded</DebugType>
-    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.0" />
+    <!-- Framework assemblies not in the default SDK-style reference set -->
+    <Reference Include="System.Net.Http" />
+    <Reference Include="System.ServiceProcess" />
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="rdpwrap.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('rdpwrap.dll')" />
-    <None Update="rdpwrap.ini" CopyToOutputDirectory="PreserveNewest" Condition="Exists('rdpwrap.ini')" />
-    <None Update="启动_RDPWrapTool.cmd" CopyToOutputDirectory="PreserveNewest" Condition="Exists('启动_RDPWrapTool.cmd')" />
+    <!-- Allows building net48 on machines without the targeting pack installed -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="rdpwrap.dll" LogicalName="RDPWrapTool.Assets.rdpwrap.dll" />
+    <EmbeddedResource Include="rdpwrap.ini" LogicalName="RDPWrapTool.Assets.rdpwrap.ini" />
   </ItemGroup>
 
 </Project>

@@ -1,24 +1,45 @@
-# RDPWrapTool v1.0.0
+# RDPWrapTool 当前版本
 
-首个公开测试版。
+本版本将项目整理为更轻量的单 exe 发布形态。
 
-## 内容
+## 主要变化
 
-- Windows Forms 图形化管理、检测和安装工具。
-- RDP Wrapper C++ 源码及已验证的 `rdpwrap.dll`。
-- Windows 10/11 x64 便携运行环境（自带 .NET 8 Desktop Runtime）。
-- Windows 11 25H2 / Build 26200.8875 的分析与验证记录。
+- 清理临时脚本、测试 DLL、构建中间产物和旧渲染工程。
+- 新增 `PROJECT_STRUCTURE.md`，说明项目目录、文件用途、构建和打包命令。
+- `rdpwrap.dll` 和 `rdpwrap.ini` 已内置到 `RDPWrapTool.exe`。
+- 用户分发时只需要拷贝 `bin\RDPWrapTool.exe`。
+- 新增 `AssetManager`，首次运行自动释放内置 DLL/INI。
+- 安装 RDPWrap 时自动启用 Windows 远程桌面和防火墙规则。
+- 总览页和安装部署页新增“启用远程桌面”按钮。
+- 创建用户、加入 RDP 用户组后自动启用 Windows 远程桌面。
+- 自动分析仍采用严格验证策略：验证失败不写入 INI。
 
-## 下载
+## 发布文件
 
-请下载 `RDPWrapTool-v1.0.0-win-x64-portable.zip`。GitHub 自动生成的 Source code 压缩包只包含源码，不能直接运行。
+普通用户只需要下载：
 
-- ZIP 大小：70,156,519 字节
-- ZIP SHA256：`68788D19456D4EC7D6DE14537BC56A7EB125FE762F204B817914C59011E52977`
-- `rdpwrap.dll` SHA256：`654743426627198E959CEF9998E1FC9D2BF6F0973E44EFD4F975F43820E455DF`
+```text
+RDPWrapTool.exe
+```
 
-## 注意
+仓库内对应路径：
 
-这是测试版本。修改远程桌面服务前请准备本地登录和恢复手段；自动分析证据不足时不要强行安装。
+```text
+bin\RDPWrapTool.exe
+```
 
-本项目是 RDP Wrapper / SuperRDP 的衍生项目，相关源码按 Apache License 2.0 发布并保留上游版权声明。便携包内 Microsoft .NET Runtime 适用其随附许可证。
+## 构建方式
+
+在项目根目录执行：
+
+```powershell
+dotnet restore src\RDPWrapTool\RDPWrapTool.csproj
+dotnet build src\RDPWrapTool\RDPWrapTool.csproj -c Release
+Copy-Item src\RDPWrapTool\bin\Release\net48\RDPWrapTool.exe bin\RDPWrapTool.exe -Force
+```
+
+更完整的构建和打包说明见：
+
+```text
+PROJECT_STRUCTURE.md
+```

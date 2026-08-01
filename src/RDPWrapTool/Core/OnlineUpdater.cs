@@ -11,12 +11,15 @@ namespace RDPWrapTool.Core;
 /// </summary>
 public class OnlineUpdater
 {
-    // Default update URLs - user can customize
+    // Default update URLs - sebaxakerhtc is the most up-to-date community source;
+    // jsDelivr mirrors are used because raw.githubusercontent.com is often unreachable.
     public static readonly string[] DefaultUrls = new[]
     {
-        "https://raw.githubusercontent.com/stascorp/rdpwrap/master/res/rdpwrap.ini",
-        "https://raw.githubusercontent.com/anhkgg/SuperRDP/main/bin/rdpwrap.ini",
-        "https://raw.githubusercontent.com/asmtron/rdpwrap/master/res/rdpwrap.ini"
+        "https://fastly.jsdelivr.net/gh/sebaxakerhtc/rdpwrap.ini@master/rdpwrap.ini",
+        "https://cdn.jsdelivr.net/gh/sebaxakerhtc/rdpwrap.ini@master/rdpwrap.ini",
+        "https://raw.githubusercontent.com/sebaxakerhtc/rdpwrap.ini/master/rdpwrap.ini",
+        "https://raw.githubusercontent.com/asmtron/rdpwrap/master/res/rdpwrap.ini",
+        "https://raw.githubusercontent.com/anhkgg/SuperRDP/main/bin/rdpwrap.ini"
     };
 
     private readonly string _iniPath;
@@ -30,8 +33,8 @@ public class OnlineUpdater
         _iniPath = iniPath;
         _client = new HttpClient();
         _client.Timeout = TimeSpan.FromSeconds(30);
-        // Set TLS support
-        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+        // Set TLS support (Tls13 enum value 12288, not defined on net48)
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | (SecurityProtocolType)12288;
     }
 
     /// <summary>
@@ -64,8 +67,9 @@ public class OnlineUpdater
             if (File.Exists(_iniPath))
                 File.Copy(_iniPath, backupPath, true);
 
-            // Save new INI
-            await File.WriteAllTextAsync(_iniPath, content);
+            // Save new INI (normalized CRLF, no BOM, trailing CRLF guaranteed)
+            File.WriteAllText(_iniPath, IniManager.NormalizeCrlf(content), new System.Text.UTF8Encoding(false));
+            await Task.CompletedTask;
 
             Log($"[+] INI updated successfully ({content.Length} bytes).");
             Log($"[*] Backup saved to: {backupPath}");

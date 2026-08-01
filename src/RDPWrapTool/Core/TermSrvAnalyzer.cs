@@ -3,13 +3,22 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace RDPWrapTool.Core;
 
 /// <summary>
 /// Auto-analyzes termsrv.dll to find patch offsets and generate INI configuration.
-/// This enables support for new Windows versions not yet in the INI file.
+///
+/// Strategy (learned from community-verified configs):
+/// - Every patch point has known byte-shape variants (old pre-24H2 shape and new
+///   24H2/25H2/26H2 shape). Each variant is searched by exact signature; the
+///   winning shape also determines the patch CODE.
+/// - SLInit data is located via RIP-relative-write anchors (mov dword[rip],imm=1
+///   -> bInitialized), the hook function is found by intra-function writes or by
+///   caller cross-reference, with ambiguity scoring.
+/// - EVERY result is byte-level verified by OffsetVerifier before being accepted.
+///   Strict policy: if any of the four patch points cannot be verified, the whole
+///   analysis fails and nothing is written.
 /// </summary>
 public class TermSrvAnalyzer
 {
@@ -19,11 +28,25 @@ public class TermSrvAnalyzer
     public class AnalysisResult
     {
         public string Version { get; set; } = "";
+        public List<string> Aliases { get; } = new();
         public bool Success { get; set; }
-        public uint DefPolicyOffset { get; set; }
-        public uint SLInitOffset { get; set; }
-        public uint SingleUserOffset { get; set; }
+
         public uint LocalOnlyOffset { get; set; }
+        public string LocalOnlyCode { get; set; } = "";
+        public bool LocalOnlyVerified { get; set; }
+
+        public uint SingleUserOffset { get; set; }
+        public string SingleUserCode { get; set; } = "";
+        public bool SingleUserVerified { get; set; }
+
+        public uint DefPolicyOffset { get; set; }
+        public string DefPolicyCode { get; set; } = "";
+        public bool DefPolicyVerified { get; set; }
+
+        public uint SLInitOffset { get; set; }
+        public string SlInitStrategy { get; set; } = "";
+        public bool SlInitVerified { get; set; }
+
         public uint BInitialized { get; set; }
         public uint BServerSku { get; set; }
         public uint LMaxUserSessions { get; set; }
@@ -32,13 +55,23 @@ public class TermSrvAnalyzer
         public uint BMultimonAllowed { get; set; }
         public uint UlMaxDebugSessions { get; set; }
         public uint BFUSEnabled { get; set; }
+
+        public List<string> Errors { get; } = new();
         public string Report { get; set; } = "";
-        public List<string> Warnings { get; set; } = new();
     }
 
-    /// <summary>
-    /// Analyze termsrv.dll and generate patch offsets.
-    /// </summary>
+    private class RipRef
+    {
+        public int FileOffset;
+        public uint TargetRva;
+        public uint Imm;
+        public string Kind = "";
+    }
+
+    // =====================================================================
+    // Main entry
+    // =====================================================================
+
     public AnalysisResult Analyze(string? termsrvPath = null)
     {
         if (string.IsNullOrEmpty(termsrvPath))
@@ -46,638 +79,710 @@ public class TermSrvAnalyzer
 
         var result = new AnalysisResult();
         var report = new StringBuilder();
+        void Rep(string s) { Log(s); report.AppendLine(s); }
 
-        Log($"[*] Analyzing: {termsrvPath}");
+        Rep($"[*] Analyzing: {termsrvPath}");
 
         if (!File.Exists(termsrvPath))
         {
-            Log("[-] termsrv.dll not found!");
-            result.Success = false;
-            result.Report = "termsrv.dll not found.";
+            Rep("[-] termsrv.dll not found!");
+            result.Errors.Add("termsrv.dll not found");
+            result.Report = report.ToString();
             return result;
         }
 
-        // Get version
-        var ver = RDPWrapInstaller.GetFileVersion(termsrvPath);
-        if (ver == null)
+        // ---- version candidates (section naming) ----
+        var versions = VersionHelper.GetCandidateVersions(termsrvPath, msg => Rep(msg));
+        if (versions.Count == 0)
         {
-            Log("[-] Cannot get termsrv.dll version.");
-            result.Success = false;
-            result.Report = "Cannot get termsrv.dll version.";
+            Rep("[-] Cannot determine termsrv.dll version.");
+            result.Errors.Add("version unknown");
+            result.Report = report.ToString();
             return result;
         }
-
-        result.Version = $"{ver.Major}.{ver.Minor}.{ver.Build}.{ver.Revision}";
-        Log($"[+] termsrv.dll version: {result.Version}");
-        report.AppendLine($"termsrv.dll version: {result.Version}");
+        result.Version = versions[0];
+        result.Aliases.AddRange(versions);
+        Rep($"[+] primary version: {result.Version} ({versions.Count} section name(s) will be written)");
 
         using var pe = new PEAnalyzer(termsrvPath);
-        Log($"[+] PE parsed: {pe.Sections.Count} sections, ImageBase=0x{pe.ImageBase:X}");
+        if (pe.TextSection == null || pe.DataSection == null)
+        {
+            Rep("[-] PE has no .text/.data section.");
+            result.Errors.Add("bad PE");
+            result.Report = report.ToString();
+            return result;
+        }
+        Rep($"[+] PE parsed: {pe.Sections.Count} sections, .text=0x{pe.TextSection.VirtualAddress:X}/0x{pe.TextSection.VirtualSize:X}, .data=0x{pe.DataSection.VirtualAddress:X}/0x{pe.DataSection.VirtualSize:X}");
 
-        // 1. Find CDefPolicy::Query (DefPolicyOffset)
-        Log("[*] Searching for CDefPolicy::Query (offset 0x638 access)...");
-        uint defPolicyOffset = FindDefPolicyOffset(pe);
-        if (defPolicyOffset > 0)
-        {
-            result.DefPolicyOffset = defPolicyOffset;
-            Log($"[+] Found DefPolicyOffset: 0x{defPolicyOffset:X}");
-            report.AppendLine($"DefPolicyOffset: 0x{defPolicyOffset:X}");
-        }
-        else
-        {
-            Log("[-] Could not find CDefPolicy::Query.");
-            result.Warnings.Add("DefPolicyOffset not found - DefPolicy patch will be skipped.");
-        }
+        int codeStart = (int)pe.TextSection.RawDataOffset;
+        int codeSize = (int)Math.Min(pe.TextSection.RawDataSize, pe.DataLength - codeStart);
 
-        // 2. Find CSLQuery::Initialize (SLInitOffset) and extract data offsets
-        Log("[*] Searching for CSLQuery::Initialize...");
-        var slInitResult = FindSLInitOffsets(pe);
-        if (slInitResult.foundOffset > 0)
-        {
-            result.SLInitOffset = slInitResult.foundOffset;
-            Log($"[+] Found SLInitOffset: 0x{slInitResult.foundOffset:X}");
-            report.AppendLine($"SLInitOffset: 0x{slInitResult.foundOffset:X}");
+        // ---- 1. LocalOnly ----
+        Rep("");
+        Rep("[*] --- LocalOnly (CEnforcementCore::GetInstanceOfTSLicense) ---");
+        FindLocalOnly(pe, codeStart, codeSize, result, Rep);
 
-            if (slInitResult.dataOffsets.Count > 0)
-            {
-                var offsets = slInitResult.dataOffsets;
-                // Match offsets to variable names based on relative spacing
-                MatchSlInitDataOffsets(offsets, result, report);
-            }
-            else
-            {
-                result.Warnings.Add("SLInit data offsets could not be extracted.");
-            }
-        }
-        else
-        {
-            Log("[-] Could not find CSLQuery::Initialize.");
-            result.Warnings.Add("SLInitOffset not found - SLInit hook will be skipped.");
-        }
+        // ---- 2. SingleUser ----
+        Rep("");
+        Rep("[*] --- SingleUser (CSessionArbitrationHelper::IsSingleSessionPerUserEnabled) ---");
+        FindSingleUser(pe, codeStart, codeSize, result, Rep);
 
-        // 3. Find SingleUserOffset
-        Log("[*] Searching for SingleUserOffset...");
-        uint singleUserOffset = FindSingleUserOffset(pe);
-        if (singleUserOffset > 0)
-        {
-            result.SingleUserOffset = singleUserOffset;
-            Log($"[+] Found SingleUserOffset: 0x{singleUserOffset:X}");
-            report.AppendLine($"SingleUserOffset: 0x{singleUserOffset:X}");
-        }
-        else
-        {
-            Log("[-] Could not find SingleUserOffset.");
-            result.Warnings.Add("SingleUserOffset not found - SingleUser patch will be skipped.");
-        }
+        // ---- 3. DefPolicy ----
+        Rep("");
+        Rep("[*] --- DefPolicy (CDefPolicy::Query) ---");
+        FindDefPolicy(pe, codeStart, codeSize, result, Rep);
 
-        // 4. Find LocalOnlyOffset
-        Log("[*] Searching for LocalOnlyOffset...");
-        uint localOnlyOffset = FindLocalOnlyOffset(pe);
-        if (localOnlyOffset > 0)
-        {
-            result.LocalOnlyOffset = localOnlyOffset;
-            Log($"[+] Found LocalOnlyOffset: 0x{localOnlyOffset:X}");
-            report.AppendLine($"LocalOnlyOffset: 0x{localOnlyOffset:X}");
-        }
-        else
-        {
-            Log("[-] Could not find LocalOnlyOffset.");
-            result.Warnings.Add("LocalOnlyOffset not found - LocalOnly patch will be skipped.");
-        }
+        // ---- 4. SLInit ----
+        Rep("");
+        Rep("[*] --- SLInit (CSLQuery::Initialize + data block) ---");
+        FindSLInit(pe, codeStart, codeSize, result, Rep);
 
-        result.Success = defPolicyOffset > 0 || slInitResult.foundOffset > 0;
+        // ---- final verdict ----
+        Rep("");
+        result.Success = result.LocalOnlyVerified && result.SingleUserVerified
+                      && result.DefPolicyVerified && result.SlInitVerified;
+        Rep(result.Success
+            ? "[+] ALL FOUR patch points found and byte-verified. Safe to write INI."
+            : "[-] STRICT MODE: not all patch points verified. NOTHING will be written.");
+        foreach (var e in result.Errors) Rep($"    missing: {e}");
+        if (!result.Success)
+            Rep("[!] Diagnostic: hex dumps above show rejected candidates. Send this full report to update the rule library for this Windows build.");
+
         result.Report = report.ToString();
         return result;
     }
 
-    /// <summary>
-    /// Find CDefPolicy::Query by searching for access to offset 0x638 on a structure.
-    /// The displacement 0x638 in x64 appears as bytes 38 06 00 00.
-    /// </summary>
-    private uint FindDefPolicyOffset(PEAnalyzer pe)
+    // =====================================================================
+    // LocalOnly
+    // =====================================================================
+
+    private void FindLocalOnly(PEAnalyzer pe, int codeStart, int codeSize, AnalysisResult result, Action<string> Rep)
     {
-        if (pe.TextSection == null) return 0;
+        // New shape (24H2+/25H2/26H2, community-verified on 26100 & 28000):
+        //   74 44                jz short +0x44          <- patch this byte (jmpshort)
+        //   83 3D xx xx xx xx 02 cmp dword [rip+x], 2
+        var sig = new byte?[] { 0x74, 0x44, 0x83, 0x3D, null, null, null, null, 0x02 };
+        var matches = pe.FindAllPatterns(sig, codeStart, codeSize);
+        Rep($"[*] new-shape signature (74 44 83 3D .. 02): {matches.Count} match(es)");
 
-        int codeStart = (int)pe.TextSection.RawDataOffset;
-        int codeSize = (int)pe.TextSection.RawDataSize;
-
-        // Search for [rcx+638h] access patterns:
-        // 89 81 38 06 00 00 = mov [rcx+638h], eax
-        // 89 89 38 06 00 00 = mov [rcx+638h], ecx
-        // 8B 81 38 06 00 00 = mov eax, [rcx+638h]
-        // 83 B9 38 06 00 00 = cmp dword [rcx+638h], XX
-
-        // Pattern: XX 81/89/B9 38 06 00 00 (with wildcard for first byte)
-        byte[] pattern = { 0xFF, 0x81, 0x38, 0x06, 0x00, 0x00 };
-        var matches = pe.FindAllPatterns(pattern, codeStart, codeSize);
-
-        foreach (var match in matches)
+        if (matches.Count == 1)
         {
-            // Verify it's actually a mov/cmp instruction with rcx
-            byte opcode = pe.ReadByte(match);
-            if (opcode != 0x89 && opcode != 0x8B && opcode != 0x83)
+            uint rva = pe.OffsetToRVA(matches[0]);
+            if (VerifyLocalOnlyAt(pe, rva, result, Rep)) return;
+        }
+        else if (matches.Count > 1)
+        {
+            Rep("[!] signature ambiguous, trying per-candidate verification...");
+            foreach (var m in matches)
             {
-                // Also check 2-byte opcode variants
-                pattern = new byte[] { 0xFF, 0x89, 0x38, 0x06, 0x00, 0x00 };
-                matches = pe.FindAllPatterns(pattern, codeStart, codeSize);
-                foreach (var m in matches)
+                uint rva = pe.OffsetToRVA(m);
+                // extra context: the byte after jz's operand should be 83 3D (already in sig) — all pass;
+                // cannot disambiguate -> strict fail handled below if none unique
+                if (OffsetVerifier.VerifyLocalOnly(pe, rva, out _))
                 {
-                    byte op = pe.ReadByte(m);
-                    if (op == 0x89)
+                    Rep($"    candidate 0x{rva:X} verifies, but ambiguity remains");
+                }
+            }
+            result.Errors.Add("LocalOnly ambiguous");
+            Rep("[-] LocalOnly: ambiguous signature matches, rejected (strict).");
+            return;
+        }
+
+        // Old-shape fallback: xref to "LocalOnly" string, then first jz in the function
+        Rep("[*] trying old-shape fallback (string xref)...");
+        foreach (var s in new[] { "LocalOnly", "TSLicense" })
+        {
+            byte[] strBytes = Encoding.Unicode.GetBytes(s);
+            int strPos = pe.FindPattern(strBytes, 0);
+            if (strPos < 0)
+            {
+                strBytes = Encoding.ASCII.GetBytes(s);
+                strPos = pe.FindPattern(strBytes, 0);
+            }
+            if (strPos <= 0) continue;
+            uint strRVA = pe.OffsetToRVA(strPos);
+            Rep($"[*] found '{s}' string at RVA 0x{strRVA:X}");
+
+            foreach (var leaMatch in pe.FindAllPatterns(new byte?[] { 0x48, 0x8D, 0x0D }, codeStart, codeSize))
+            {
+                int disp = (int)pe.ReadUInt32(leaMatch + 3);
+                uint instRVA = pe.OffsetToRVA(leaMatch);
+                if ((uint)(instRVA + 7 + disp) != strRVA) continue;
+
+                uint funcStart = FindFunctionStart(pe, leaMatch, codeStart);
+                if (funcStart == 0) continue;
+                int funcOff = (int)pe.RVAToOffset(funcStart);
+                for (int i = funcOff; i < funcOff + 512 && i + 1 < codeStart + codeSize; i++)
+                {
+                    if (pe.ReadByte(i) != 0x74) continue;
+                    uint rva = pe.OffsetToRVA(i);
+                    if (VerifyLocalOnlyAt(pe, rva, result, Rep)) return;
+                }
+            }
+        }
+
+        result.Errors.Add("LocalOnly");
+        Rep("[-] LocalOnly: not found.");
+    }
+
+    private bool VerifyLocalOnlyAt(PEAnalyzer pe, uint rva, AnalysisResult result, Action<string> Rep)
+    {
+        if (OffsetVerifier.VerifyLocalOnly(pe, rva, out string detail))
+        {
+            result.LocalOnlyOffset = rva;
+            result.LocalOnlyCode = OffsetVerifier.CodeJmpShort;
+            result.LocalOnlyVerified = true;
+            Rep($"[+] LocalOnlyOffset = 0x{rva:X} ({OffsetVerifier.CodeJmpShort}) VERIFIED: {detail}");
+            return true;
+        }
+        Rep($"[-] LocalOnly candidate 0x{rva:X} failed verification: {detail}");
+        return false;
+    }
+
+    // =====================================================================
+    // SingleUser
+    // =====================================================================
+
+    private void FindSingleUser(PEAnalyzer pe, int codeStart, int codeSize, AnalysisResult result, Action<string> Rep)
+    {
+        // Unified shape (byte-verified on 19041, 26100 & 28000):
+        //   8D 57 40               lea edx, [rdi+40h]
+        //   48 8D 4D 90            lea rcx, [rbp-70h]
+        //   48 FF 15 xx xx xx xx   call qword [rip+x]   <- patch 7 bytes (mov eax,1 + nop*2)
+        //   0F 1F 44 00 00         nop dword [rax+0]
+        //   85 C0                  test eax, eax
+        //   0F 84/85 ..            jz/jnz near (jz on Win11, jnz on Win10)
+        var sig = new byte?[] { 0x8D, 0x57, 0x40, 0x48, 0x8D, 0x4D, 0x90, 0x48, 0xFF, 0x15, null, null, null, null, 0x0F, 0x1F, 0x44, 0x00, 0x00, 0x85, 0xC0, 0x0F, null };
+        var matches = pe.FindAllPatterns(sig, codeStart, codeSize)
+            .Where(m => m + 23 <= codeStart + codeSize && (pe.ReadByte(m + 22) == 0x84 || pe.ReadByte(m + 22) == 0x85))
+            .ToList();
+        Rep($"[*] unified signature (lea edx/rcx; call [rip]; nop; test eax,eax; jz/jnz): {matches.Count} match(es)");
+
+        if (matches.Count == 1)
+        {
+            uint rva = pe.OffsetToRVA(matches[0] + 7); // the call [rip] instruction
+            if (VerifySingleUserAt(pe, rva, OffsetVerifier.CodeMovEax1Nop2, result, Rep)) return;
+        }
+        else if (matches.Count > 1)
+        {
+            result.Errors.Add("SingleUser ambiguous");
+            Rep("[-] SingleUser: ambiguous signature matches, rejected (strict).");
+            return;
+        }
+
+        // Old shape: B0 01 C3 (mov al,1; ret) leaf function at CC boundary -> patch the 01 with 00
+        Rep("[*] trying old-shape fallback (B0 01 C3 leaf)...");
+        var leaf = new byte?[] { 0xB0, 0x01, 0xC3 };
+        var candidates = pe.FindAllPatterns(leaf, codeStart, codeSize);
+        Rep($"[*] B0 01 C3 occurrences: {candidates.Count}");
+        int accepted = 0;
+        uint acceptedRva = 0;
+        foreach (var c in candidates)
+        {
+            if (c <= codeStart) continue;
+            if (pe.ReadByte(c - 1) != 0xCC) continue; // must start a function
+            accepted++;
+            acceptedRva = pe.OffsetToRVA(c + 1);
+        }
+        if (accepted == 1)
+        {
+            if (VerifySingleUserAt(pe, acceptedRva, OffsetVerifier.CodeZero, result, Rep)) return;
+        }
+        else if (accepted > 1)
+        {
+            Rep($"[!] {accepted} boundary-aligned B0 01 C3 candidates, ambiguous (strict).");
+        }
+
+        result.Errors.Add("SingleUser");
+        Rep("[-] SingleUser: not found.");
+    }
+
+    private bool VerifySingleUserAt(PEAnalyzer pe, uint rva, string code, AnalysisResult result, Action<string> Rep)
+    {
+        if (OffsetVerifier.VerifySingleUser(pe, rva, code, out string detail))
+        {
+            result.SingleUserOffset = rva;
+            result.SingleUserCode = code;
+            result.SingleUserVerified = true;
+            Rep($"[+] SingleUserOffset = 0x{rva:X} ({code}) VERIFIED: {detail}");
+            return true;
+        }
+        Rep($"[-] SingleUser candidate 0x{rva:X} failed verification: {detail}");
+        return false;
+    }
+
+    // =====================================================================
+    // DefPolicy
+    // =====================================================================
+
+    private void FindDefPolicy(PEAnalyzer pe, int codeStart, int codeSize, AnalysisResult result, Action<string> Rep)
+    {
+        // Shape families, in priority order. Each tuple: signature, patch code, description.
+        // Multiple raw matches are expected; the verifier's mandatory suffix check
+        // (cmp r8d,r9d; jcc) filters them down to the one true CDefPolicy::Query site.
+        var families = new (byte?[] sig, string code, string desc)[]
+        {
+            // mov r9d, [rdi+638h]  (25H2 verified)
+            (new byte?[] { 0x44, 0x8B, 0x8F, 0x38, 0x06, 0x00, 0x00 }, OffsetVerifier.CodeDefPolicyR9dRdiJmp, "mov r9d,[rdi+638h]"),
+            // mov r8d, [rdi+63Ch]  (26H2 verified)
+            (new byte?[] { 0x44, 0x8B, 0x87, 0x3C, 0x06, 0x00, 0x00 }, OffsetVerifier.CodeDefPolicyR9dRdiJmp, "mov r8d,[rdi+63Ch]"),
+            // mov r8d, [rdi+638h]
+            (new byte?[] { 0x44, 0x8B, 0x87, 0x38, 0x06, 0x00, 0x00 }, OffsetVerifier.CodeDefPolicyR9dRdiJmp, "mov r8d,[rdi+638h]"),
+            // mov r9d, [rdi+63Ch]
+            (new byte?[] { 0x44, 0x8B, 0x8F, 0x3C, 0x06, 0x00, 0x00 }, OffsetVerifier.CodeDefPolicyR9dRdiJmp, "mov r9d,[rdi+63Ch]"),
+        };
+
+        foreach (var (sig, code, desc) in families)
+        {
+            var matches = pe.FindAllPatterns(sig, codeStart, codeSize);
+            Rep($"[*] {desc}: {matches.Count} raw match(es)");
+            uint acceptedRva = 0;
+            int accepted = 0;
+            foreach (var m in matches)
+            {
+                uint rva = pe.OffsetToRVA(m);
+                if (OffsetVerifier.VerifyDefPolicy(pe, rva, code, out string vd))
+                {
+                    accepted++;
+                    acceptedRva = rva;
+                    Rep($"    candidate 0x{rva:X} passes byte verification ({vd})");
+                }
+                else
+                {
+                    Rep($"    candidate 0x{rva:X} rejected ({vd})");
+                    DumpAt(pe, rva, 20, "DefPolicy", Rep);
+                }
+            }
+            if (accepted == 1)
+            {
+                if (VerifyDefPolicyAt(pe, acceptedRva, code, result, Rep)) return;
+            }
+            else if (accepted > 1)
+            {
+                Rep($"[!] {desc}: {accepted} verified candidates, ambiguous, trying next shape...");
+            }
+        }
+
+        // Old shape (rdpwrap KB, Win10 19041 verified): mov eax,[rcx+638h]; cmp [rcx+63Ch],eax
+        // Dispatch on the jcc that follows: far (0F 84/85) -> patch the CMP (match+6)
+        // with 12-byte eax_rcx; short (74/75) -> patch the MOV (match) with 13-byte
+        // eax_rcx_jmp whose trailing EB reuses the short jcc displacement.
+        var oldSig = new byte?[] { 0x8B, 0x81, 0x38, 0x06, 0x00, 0x00, 0x39, 0x81, 0x3C, 0x06, 0x00, 0x00 };
+        var oldMatches = pe.FindAllPatterns(oldSig, codeStart, codeSize);
+        Rep($"[*] old-shape (mov eax,[rcx+638h]; cmp [rcx+63Ch],eax): {oldMatches.Count} raw match(es)");
+        int oldAcc = 0; uint oldRva = 0; string oldCode = "";
+        foreach (var m in oldMatches)
+        {
+            byte j0 = pe.ReadByte(m + 12), j1 = pe.ReadByte(m + 13);
+            uint rva; string code;
+            if (j0 == 0x0F && (j1 == 0x84 || j1 == 0x85)) { rva = pe.OffsetToRVA(m + 6); code = OffsetVerifier.CodeDefPolicyEaxRcx; }
+            else if (j0 == 0x74 || j0 == 0x75) { rva = pe.OffsetToRVA(m); code = OffsetVerifier.CodeDefPolicyEaxRcxJmp; }
+            else { Rep($"    old-shape candidate at 0x{pe.OffsetToRVA(m):X}: unknown jcc {j0:X2} {j1:X2}"); DumpAt(pe, pe.OffsetToRVA(m), 20, "old-shape", Rep); continue; }
+            if (OffsetVerifier.VerifyDefPolicy(pe, rva, code, out string vd))
+            {
+                oldAcc++; oldRva = rva; oldCode = code;
+                Rep($"    old-shape candidate 0x{rva:X} ({code}) passes ({vd})");
+            }
+            else { Rep($"    old-shape candidate 0x{rva:X} ({code}) rejected ({vd})"); DumpAt(pe, rva, 20, "old-shape", Rep); }
+        }
+        if (oldAcc == 1) { if (VerifyDefPolicyAt(pe, oldRva, oldCode, result, Rep)) return; }
+        else if (oldAcc > 1) Rep($"[!] old-shape: {oldAcc} verified candidates, ambiguous (strict).");
+
+        result.Errors.Add("DefPolicy");
+        Rep("[-] DefPolicy: not found.");
+    }
+
+    private bool VerifyDefPolicyAt(PEAnalyzer pe, uint rva, string code, AnalysisResult result, Action<string> Rep)
+    {
+        if (OffsetVerifier.VerifyDefPolicy(pe, rva, code, out string detail))
+        {
+            result.DefPolicyOffset = rva;
+            result.DefPolicyCode = code;
+            result.DefPolicyVerified = true;
+            Rep($"[+] DefPolicyOffset = 0x{rva:X} ({code}) VERIFIED: {detail}");
+            return true;
+        }
+        Rep($"[-] DefPolicy candidate 0x{rva:X} failed verification: {detail}");
+        return false;
+    }
+
+    // =====================================================================
+    // SLInit
+    // =====================================================================
+
+    private void FindSLInit(PEAnalyzer pe, int codeStart, int codeSize, AnalysisResult result, Action<string> Rep)
+    {
+        // E8-anchored function map (probe4-finalized, byte-verified on 19041 & 25H2):
+        // function starts = distinct E8 call targets inside .text; a body spans
+        // [start, min(next start, first >=6-byte CC run after start+16, .text end)).
+        // CC bytes INSIDE instructions (disp32 etc.) are never mistaken for padding
+        // because only E8 TARGETS can become starts.
+        var fnSet = new SortedSet<uint>();
+        int e8End = codeStart + codeSize - 5;
+        for (int i = codeStart; i < e8End; i++)
+        {
+            if (pe.ReadByte(i) != 0xE8) continue;
+            int rel = (int)pe.ReadUInt32(i + 1);
+            uint tgt = (uint)(pe.OffsetToRVA(i) + 5 + rel);
+            if (pe.TextSection != null && pe.TextSection.ContainsRVA(tgt))
+                fnSet.Add(tgt);
+        }
+        var fns = fnSet.ToList();
+        Rep($"[*] E8-anchored function starts in .text: {fns.Count}");
+        if (fns.Count == 0) { result.Errors.Add("SLInit"); Rep("[-] SLInit: no E8 targets (unexpected)."); return; }
+
+        var bodies = new List<(int start, int end)>();
+        for (int idx = 0; idx < fns.Count; idx++)
+        {
+            int fo = (int)pe.RVAToOffset(fns[idx]);
+            if (fo <= 0) continue;
+            int nxt = idx + 1 < fns.Count ? (int)pe.RVAToOffset(fns[idx + 1]) : codeStart + codeSize;
+            bodies.Add((fo, Math.Min(Math.Min(nxt, FirstCcRun(pe, fo + 16, codeStart + codeSize)), codeStart + codeSize)));
+        }
+        var bodyStarts = bodies.Select(bd => bd.start).ToList();
+        int Owner(int off)
+        {
+            int idx = bodyStarts.BinarySearch(off);
+            if (idx < 0) idx = ~idx - 1;
+            return idx >= 0 && off < bodies[idx].end ? idx : -1;
+        }
+
+        // Broad RIP-relative reference scan (reads+writes, probe4 byte-walk).
+        var refs = ScanBroadRipRefs(pe, codeStart, codeSize);
+        Rep($"[*] broad RIP refs near .data: {refs.Count}");
+
+        // Anchors: mov dword [rip]->.data, imm=1 (bInitialized candidates).
+        var anchors = ScanRipWrites(pe, codeStart, codeSize)
+            .Where(w => w.Kind == "C7" && w.Imm == 1 && InData(pe, w.TargetRva))
+            .Select(w => w.TargetRva).Distinct().OrderBy(x => x).ToList();
+        Rep($"[*] anchor blocks (C7 05 imm=1 -> .data): {anchors.Count}");
+
+        // Score: for each anchor block, the function referencing the MOST DISTINCT
+        // slot deltas (0..0x28 step 4) IS CSLQuery::Initialize.
+        var scored = new List<(int score, uint block, uint hook, HashSet<uint> slots)>();
+        foreach (var blk in anchors)
+        {
+            var per = new Dictionary<int, HashSet<uint>>();
+            foreach (var (off, tgt) in refs)
+            {
+                uint delta = tgt - blk;  // wraps for tgt < blk; huge values filtered below
+                if (delta > 0x28 || (delta & 3) != 0) continue;
+                int o = Owner(off);
+                if (o < 0) continue;
+                if (!per.TryGetValue(o, out var s)) per[o] = s = new HashSet<uint>();
+                s.Add(delta);
+            }
+            if (per.Count == 0) continue;
+            var top = per.OrderByDescending(kv => kv.Value.Count).First();
+            uint hook = pe.OffsetToRVA(bodies[top.Key].start);
+            scored.Add((top.Value.Count, blk, hook, top.Value));
+            Rep($"    block 0x{blk:X}: topFunc=0x{hook:X} distinctSlots={top.Value.Count} hasZeroSlot={top.Value.Contains(0)}");
+        }
+
+        var ranked = scored.OrderByDescending(s => s.score).ToList();
+        if (ranked.Count > 0)
+        {
+            int best = ranked[0].score;
+            var leaders = ranked.Where(s => s.score == best).ToList();
+            if (leaders.Count > 1)
+            {
+                // tie-break: the TRUE block's slot set contains delta=0 (bInitialized
+                // is read at the block head); the overlapping decoy block's does not.
+                var withZero = leaders.Where(s => s.slots.Contains(0u)).ToList();
+                if (withZero.Count > 0) leaders = withZero;
+            }
+            if (leaders.Count == 1 && best >= 7)
+            {
+                var win = leaders[0];
+                Rep($"[+] SLInit winner: block=0x{win.block:X} hook=0x{win.hook:X} (distinctSlots={best}, unique)");
+
+                // Layout by build family (Win11 >=22000 -> A, Win10 -> B); the choice
+                // is verified: every one of the 8 slots must be referenced in .text.
+                int build = ParseBuild(result.Version);
+                var tries = build >= 22000
+                    ? new[] { (OffsetVerifier.SlInitLayoutA, OffsetVerifier.SlInitBlockSizeA, "A/Win11"), (OffsetVerifier.SlInitLayoutB, OffsetVerifier.SlInitBlockSizeB, "B/Win10") }
+                    : new[] { (OffsetVerifier.SlInitLayoutB, OffsetVerifier.SlInitBlockSizeB, "B/Win10"), (OffsetVerifier.SlInitLayoutA, OffsetVerifier.SlInitBlockSizeA, "A/Win11") };
+                var refTargets = new HashSet<uint>(refs.Select(r => r.target));
+                foreach (var (layout, blockSize, tag) in tries)
+                {
+                    if (!layout.All(kv => refTargets.Contains(win.block + (uint)kv.delta)))
                     {
-                        return FindFunctionStart(pe, m, codeStart);
+                        Rep($"[!] layout {tag}: not all 8 slots referenced, trying fallback");
+                        continue;
                     }
+                    if (AcceptSLInit(pe, win.hook, win.block, layout, blockSize, $"E8-scored/{tag}", result, Rep)) return;
                 }
-                continue;
+                Rep("[-] SLInit: winner found but no layout verified (strict).");
             }
-
-            return FindFunctionStart(pe, match, codeStart);
+            else
+            {
+                Rep($"[!] no unique SLInit leader (best={best}, leaders={leaders.Count}, need unique & >=7)");
+                foreach (var l in leaders.Take(3))
+                    DumpAt(pe, l.hook, 16, $"leader hook for block 0x{l.block:X}", Rep);
+            }
         }
-
-        // Try alternative pattern: 89 89 38 06 00 00
-        pattern = new byte[] { 0x89, 0x89, 0x38, 0x06, 0x00, 0x00 };
-        matches = pe.FindAllPatterns(pattern, codeStart, codeSize);
-        foreach (var match in matches)
+        else
         {
-            return FindFunctionStart(pe, match, codeStart);
+            Rep("[!] no anchor block scored at all");
         }
 
-        // Try: 83 B9 38 06 00 00
-        pattern = new byte[] { 0x83, 0xB9, 0x38, 0x06, 0x00, 0x00 };
-        matches = pe.FindAllPatterns(pattern, codeStart, codeSize);
-        foreach (var match in matches)
+        result.Errors.Add("SLInit");
+        Rep("[-] SLInit: not found.");
+    }
+
+    /// <summary>First run of >=6 consecutive CC (int3 padding) bytes at/after 'from'; end if none.</summary>
+    private static int FirstCcRun(PEAnalyzer pe, int from, int end)
+    {
+        for (int j = Math.Max(from, 0); j < end - 6; j++)
         {
-            return FindFunctionStart(pe, match, codeStart);
+            if (pe.ReadByte(j) == 0xCC && pe.ReadByte(j + 1) == 0xCC && pe.ReadByte(j + 2) == 0xCC &&
+                pe.ReadByte(j + 3) == 0xCC && pe.ReadByte(j + 4) == 0xCC && pe.ReadByte(j + 5) == 0xCC)
+                return j;
         }
-
-        return 0;
+        return end;
     }
 
     /// <summary>
-    /// Find the start of a function by searching backwards for a prologue or function boundary.
+    /// Broad RIP-relative reference scan (probe4 byte-walk): mov/lea/cmp/add forms
+    /// with ModRM mod=00 rm=101, plus C7 05 / C6 05 immediate writes. Returns file
+    /// offset + decoded target RVA for refs landing near .data.
     /// </summary>
-    private uint FindFunctionStart(PEAnalyzer pe, int refOffset, int searchStart)
+    private List<(int off, uint target)> ScanBroadRipRefs(PEAnalyzer pe, int codeStart, int codeSize)
     {
-        // Strategy 1: Search backwards for common function prologues
-        for (int i = refOffset; i >= Math.Max(searchStart, refOffset - 512); i--)
+        var list = new List<(int, uint)>();
+        uint dva = pe.DataSection?.VirtualAddress ?? 0;
+        uint dend = dva + (pe.DataSection?.VirtualSize ?? 0);
+        int n = codeStart + codeSize - 10;
+        for (int i = codeStart; i < n; i++)
         {
-            byte b0 = pe.ReadByte(i);
-            byte b1 = (i + 1 < pe.DataLength) ? pe.ReadByte(i + 1) : (byte)0;
-            byte b2 = (i + 2 < pe.DataLength) ? pe.ReadByte(i + 2) : (byte)0;
-
-            // Common x64 function prologues
-            if (b0 == 0x48 && b1 == 0x89 && (b2 == 0x5C || b2 == 0x6C || b2 == 0x0C))
-                return pe.OffsetToRVA(i);
-            if (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC)
-                return pe.OffsetToRVA(i);
-            if (b0 == 0x40 && (b1 == 0x53 || b1 == 0x55 || b1 == 0x56 || b1 == 0x57))
-                return pe.OffsetToRVA(i);
-            if (b0 == 0x4C && b1 == 0x8B && b2 == 0xDC)
-                return pe.OffsetToRVA(i);
-            if (b0 == 0x48 && b1 == 0x8B && b2 == 0xEC)
-                return pe.OffsetToRVA(i);
-            if (b0 == 0x48 && b1 == 0x81 && b2 == 0xEC)
-                return pe.OffsetToRVA(i);
-
-            // int3 padding before function - most reliable boundary marker
-            if (b0 == 0xCC && i + 1 <= refOffset)
-            {
-                byte next = pe.ReadByte(i + 1);
-                if (next != 0xCC)
-                    return pe.OffsetToRVA(i + 1);
-            }
+            byte c = pe.ReadByte(i);
+            byte b1 = pe.ReadByte(i + 1);
+            byte b2 = pe.ReadByte(i + 2);
+            uint tgt;
+            if ((c == 0x48 || c == 0x4C) &&
+                (b1 == 0x89 || b1 == 0x8B || b1 == 0x8D || b1 == 0x39 || b1 == 0x3B || b1 == 0x01 || b1 == 0x03) &&
+                (b2 & 0xC7) == 0x05)
+                tgt = (uint)(pe.OffsetToRVA(i) + 7 + (int)pe.ReadUInt32(i + 3));
+            else if ((c == 0x89 || c == 0x8B || c == 0x88 || c == 0x39 || c == 0x3B) && (b1 & 0xC7) == 0x05)
+                tgt = (uint)(pe.OffsetToRVA(i) + 6 + (int)pe.ReadUInt32(i + 2));
+            else if (c == 0x83 && (b1 & 0xC7) == 0x05)
+                tgt = (uint)(pe.OffsetToRVA(i) + 7 + (int)pe.ReadUInt32(i + 2));
+            else if (c == 0xC7 && b1 == 0x05)
+                tgt = (uint)(pe.OffsetToRVA(i) + 10 + (int)pe.ReadUInt32(i + 2));
+            else if (c == 0xC6 && b1 == 0x05)
+                tgt = (uint)(pe.OffsetToRVA(i) + 7 + (int)pe.ReadUInt32(i + 2));
+            else continue;
+            if (tgt >= dva - 0x100 && tgt < dend + 0x200)
+                list.Add((i, tgt));
         }
-
-        // Strategy 2: Fallback - search for CC padding or C3 ret as function boundary
-        for (int i = refOffset - 1; i >= Math.Max(searchStart, refOffset - 512); i--)
-        {
-            byte b = pe.ReadByte(i);
-            // CC (int3) padding - function starts right after
-            if (b == 0xCC)
-            {
-                // Skip consecutive CC bytes
-                while (i > searchStart && pe.ReadByte(i - 1) == 0xCC) i--;
-                return pe.OffsetToRVA(i + 1);
-            }
-            // C3 (ret) from previous function - next byte might be function start
-            if (b == 0xC3 && i > searchStart)
-            {
-                byte next = (i + 1 < pe.DataLength) ? pe.ReadByte(i + 1) : (byte)0;
-                // Only accept if followed by CC padding or a known prologue
-                if (next == 0xCC)
-                {
-                    while (i + 1 < pe.DataLength && pe.ReadByte(i + 1) == 0xCC) i++;
-                    return pe.OffsetToRVA(i + 1);
-                }
-            }
-        }
-        return 0;
+        return list;
     }
 
-    /// <summary>
-    /// Find CSLQuery::Initialize by searching for consecutive C7 05 (mov [rip+offset], imm32) instructions.
-    /// </summary>
-    private (uint foundOffset, List<(uint rva, uint value)> dataOffsets) FindSLInitOffsets(PEAnalyzer pe)
+    /// <summary>Build number from a "a.b.c.d" version string (0 if unparseable).</summary>
+    private static int ParseBuild(string version)
     {
-        if (pe.TextSection == null) return (0, new List<(uint, uint)>());
+        var parts = (version ?? "").Split('.');
+        return parts.Length >= 3 && int.TryParse(parts[2], out int b) ? b : 0;
+    }
 
-        int codeStart = (int)pe.TextSection.RawDataOffset;
-        int codeSize = (int)pe.TextSection.RawDataSize;
+    /// <summary>Hex-dump bytes at an RVA into the report (diagnostic fallback).</summary>
+    private void DumpAt(PEAnalyzer pe, uint rva, int len, string label, Action<string> Rep)
+    {
+        uint off = pe.RVAToOffset(rva);
+        if (off == 0 || off >= (uint)pe.DataLength) return;
+        Rep($"    [dump] {label} @0x{rva:X}: {OffsetVerifier.Hex(pe, (int)off, len)}");
+    }
 
-        // Search for C7 05 (mov dword [rip+disp32], imm32)
-        byte[] pattern = { 0xC7, 0x05 };
+    private bool AcceptSLInit(PEAnalyzer pe, uint hookRva, uint baseRva,
+        (string name, int delta)[] layout, int blockSize, string strategy,
+        AnalysisResult result, Action<string> Rep)
+    {
+        var data = new Dictionary<string, uint>();
+        foreach (var kv in layout)
+            data[kv.name] = baseRva + (uint)kv.delta;
 
-        // Find all C7 05 locations
-        var locations = pe.FindAllPatterns(pattern, codeStart, codeSize);
-        Log($"[*] Found {locations.Count} C7 05 (mov [rip+disp], imm32) instructions.");
+        if (!OffsetVerifier.VerifySLInit(pe, hookRva, data, layout, blockSize, out string detail))
+        {
+            Rep($"[-] SLInit candidate hook=0x{hookRva:X} failed verification: {detail}");
+            DumpAt(pe, hookRva, 16, "SLInit hook", Rep);
+            return false;
+        }
 
-        // Collect ALL C7 05 target RVAs for clustering (not just consecutive ones)
-        var allTargets = new List<(uint rva, uint value, int fileOffset)>();
-        foreach (var loc in locations)
+        result.SLInitOffset = hookRva;
+        result.SlInitStrategy = strategy;
+        result.BInitialized = data["bInitialized"];
+        result.BServerSku = data["bServerSku"];
+        result.LMaxUserSessions = data["lMaxUserSessions"];
+        result.BAppServerAllowed = data["bAppServerAllowed"];
+        result.BRemoteConnAllowed = data["bRemoteConnAllowed"];
+        result.BMultimonAllowed = data["bMultimonAllowed"];
+        result.UlMaxDebugSessions = data["ulMaxDebugSessions"];
+        result.BFUSEnabled = data["bFUSEnabled"];
+        result.SlInitVerified = true;
+        Rep($"[+] SLInitOffset = 0x{hookRva:X} ({strategy}) VERIFIED: {detail}");
+        Rep($"    bInitialized=0x{result.BInitialized:X} bServerSku=0x{result.BServerSku:X} lMaxUserSessions=0x{result.LMaxUserSessions:X}");
+        Rep($"    bAppServerAllowed=0x{result.BAppServerAllowed:X} bRemoteConnAllowed=0x{result.BRemoteConnAllowed:X} bMultimonAllowed=0x{result.BMultimonAllowed:X}");
+        Rep($"    ulMaxDebugSessions=0x{result.UlMaxDebugSessions:X} bFUSEnabled=0x{result.BFUSEnabled:X}");
+        return true;
+    }
+
+    // =====================================================================
+    // Binary scanning helpers
+    // =====================================================================
+
+    private List<RipRef> ScanRipWrites(PEAnalyzer pe, int codeStart, int codeSize)
+    {
+        var list = new List<RipRef>();
+
+        // C7 05 disp32 imm32 : mov dword [rip+disp], imm  (10 bytes)
+        foreach (var loc in pe.FindAllPatterns(new byte?[] { 0xC7, 0x05 }, codeStart, codeSize))
         {
             if (loc + 10 > codeStart + codeSize) continue;
-            // Read displacement (signed int32) - C7 05 is 10 bytes total
             int disp = (int)pe.ReadUInt32(loc + 2);
-            uint value = pe.ReadUInt32(loc + 6);
-            // Calculate target RVA: C7 05 is 10 bytes, RIP = instRVA + 10
-            uint instRVA = pe.OffsetToRVA(loc);
-            uint targetRVA = (uint)(instRVA + 10 + disp);
-            allTargets.Add((targetRVA, value, loc));
+            uint instRva = pe.OffsetToRVA(loc);
+            list.Add(new RipRef { FileOffset = loc, TargetRva = (uint)(instRva + 10 + disp), Imm = pe.ReadUInt32(loc + 6), Kind = "C7" });
         }
-        Log($"[*] Calculated {allTargets.Count} C7 05 target RVAs.");
-
-        // Also search for 48 89 05 (mov [rip+disp], rax) - 7 bytes, stores pointer
-        byte[] movRaxPat = { 0x48, 0x89, 0x05 };
-        var raxLocs = pe.FindAllPatterns(movRaxPat, codeStart, codeSize);
-        foreach (var loc in raxLocs)
+        // 48 89 05 disp32 : mov [rip+disp], rax  (7 bytes)
+        foreach (var loc in pe.FindAllPatterns(new byte?[] { 0x48, 0x89, 0x05 }, codeStart, codeSize))
         {
             if (loc + 7 > codeStart + codeSize) continue;
             int disp = (int)pe.ReadUInt32(loc + 3);
-            uint instRVA = pe.OffsetToRVA(loc);
-            uint targetRVA = (uint)(instRVA + 7 + disp);
-            allTargets.Add((targetRVA, 0, loc));
+            uint instRva = pe.OffsetToRVA(loc);
+            list.Add(new RipRef { FileOffset = loc, TargetRva = (uint)(instRva + 7 + disp), Kind = "W" });
         }
-        Log($"[*] Total targets including 48 89 05: {allTargets.Count}");
-
-        // Cluster targets by proximity (SLInit data is ~44 bytes, search within 60 bytes)
-        allTargets.Sort((a, b) => a.rva.CompareTo(b.rva));
-        for (int i = 0; i < allTargets.Count; i++)
+        // 89 05 disp32 : mov [rip+disp], eax (6 bytes) -- skip if actually 48 89 05
+        foreach (var loc in pe.FindAllPatterns(new byte?[] { 0x89, 0x05 }, codeStart, codeSize))
         {
-            var cluster = new List<(uint rva, uint value, int fileOffset)>();
-            cluster.Add(allTargets[i]);
-            for (int j = i + 1; j < allTargets.Count; j++)
-            {
-                if (allTargets[j].rva - allTargets[i].rva <= 60)
-                    cluster.Add(allTargets[j]);
-                else break;
-            }
-
-            if (cluster.Count >= 4)
-            {
-                // Try to match this cluster to the known SLInit layout
-                int[] expectedDiffs = { 0, 4, 8, 16, 24, 28, 36, 40 };
-                string[] varNames = { "bInitialized", "bServerSku", "lMaxUserSessions", "bAppServerAllowed",
-                                      "bRemoteConnAllowed", "bMultimonAllowed", "ulMaxDebugSessions", "bFUSEnabled" };
-
-                for (int baseIdx = 0; baseIdx < cluster.Count; baseIdx++)
-                {
-                    uint tryBase = cluster[baseIdx].rva;
-                    var matches = new Dictionary<string, uint>();
-                    foreach (var (rva, value, fo) in cluster)
-                    {
-                        int diff = (int)(rva - tryBase);
-                        for (int k = 0; k < expectedDiffs.Length; k++)
-                        {
-                            if (diff == expectedDiffs[k]) { matches[varNames[k]] = rva; break; }
-                        }
-                    }
-
-                    if (matches.Count >= 5) // At least 5 out of 8 matched
-                    {
-                        Log($"[+] Found SLInit data cluster with {matches.Count} matches");
-                        var dataOffsets = cluster.Select(c => (c.rva, c.value)).ToList();
-                        // Find function start from the first C7 05 in this cluster
-                        int firstFileOffset = cluster.Min(c => c.fileOffset);
-                        uint funcStart = FindFunctionStart(pe, firstFileOffset, codeStart);
-                        Log($"    SLInitOffset (function start): 0x{funcStart:X}");
-                        return (funcStart, dataOffsets);
-                    }
-                }
-            }
+            if (loc + 6 > codeStart + codeSize) continue;
+            if (loc > 0 && pe.ReadByte(loc - 1) == 0x48) continue;
+            int disp = (int)pe.ReadUInt32(loc + 2);
+            uint instRva = pe.OffsetToRVA(loc);
+            list.Add(new RipRef { FileOffset = loc, TargetRva = (uint)(instRva + 6 + disp), Kind = "W" });
         }
-
-        return (0, new List<(uint, uint)>());
+        // 88 05 disp32 : mov [rip+disp], al (6 bytes)
+        foreach (var loc in pe.FindAllPatterns(new byte?[] { 0x88, 0x05 }, codeStart, codeSize))
+        {
+            if (loc + 6 > codeStart + codeSize) continue;
+            int disp = (int)pe.ReadUInt32(loc + 2);
+            uint instRva = pe.OffsetToRVA(loc);
+            list.Add(new RipRef { FileOffset = loc, TargetRva = (uint)(instRva + 6 + disp), Kind = "W" });
+        }
+        // C6 05 disp32 imm8 : mov byte [rip+disp], imm8 (7 bytes)
+        foreach (var loc in pe.FindAllPatterns(new byte?[] { 0xC6, 0x05 }, codeStart, codeSize))
+        {
+            if (loc + 7 > codeStart + codeSize) continue;
+            int disp = (int)pe.ReadUInt32(loc + 2);
+            uint instRva = pe.OffsetToRVA(loc);
+            list.Add(new RipRef { FileOffset = loc, TargetRva = (uint)(instRva + 7 + disp), Imm = pe.ReadByte(loc + 6), Kind = "C6" });
+        }
+        return list;
     }
 
-    /// <summary>
-    /// Match extracted SLInit data offsets to variable names based on relative spacing.
-    /// Known layout (offsets from bInitialized):
-    /// +0: bInitialized, +4: bServerSku, +8: lMaxUserSessions,
-    /// +16: bAppServerAllowed, +24: bRemoteConnAllowed, +28: bMultimonAllowed,
-    /// +36: ulMaxDebugSessions, +40: bFUSEnabled
-    /// </summary>
-    private void MatchSlInitDataOffsets(List<(uint rva, uint value)> offsets, AnalysisResult result, StringBuilder report)
-    {
-        if (offsets.Count < 4) return;
+    private bool InData(PEAnalyzer pe, uint rva) => pe.DataSection != null && pe.DataSection.ContainsRVA(rva);
 
-        // Sort by RVA
-        offsets.Sort((a, b) => a.rva.CompareTo(b.rva));
-
-        // The first offset should be bInitialized
-        uint baseRVA = offsets[0].rva;
-        Log($"[*] SLInit base RVA: 0x{baseRVA:X}");
-
-        // Try to match each offset to the known layout
-        // Expected differences from base: 0, 4, 8, 16, 24, 28, 36, 40
-        int[] expectedDiffs = { 0, 4, 8, 16, 24, 28, 36, 40 };
-        string[] varNames = { "bInitialized", "bServerSku", "lMaxUserSessions", "bAppServerAllowed",
-                              "bRemoteConnAllowed", "bMultimonAllowed", "ulMaxDebugSessions", "bFUSEnabled" };
-
-        // Try matching with different bases (the first offset might not be bInitialized)
-        for (int baseIdx = 0; baseIdx < offsets.Count; baseIdx++)
-        {
-            uint tryBase = offsets[baseIdx].rva;
-            var matches = new Dictionary<string, uint>();
-
-            foreach (var (rva, value) in offsets)
-            {
-                int diff = (int)(rva - tryBase);
-                for (int k = 0; k < expectedDiffs.Length; k++)
-                {
-                    if (diff == expectedDiffs[k])
-                    {
-                        matches[varNames[k]] = rva;
-                        break;
-                    }
-                }
-            }
-
-            // If we matched at least 6 out of 8 variables, use this base
-            if (matches.Count >= 6)
-            {
-                if (matches.TryGetValue("bInitialized", out uint bi)) result.BInitialized = bi;
-                if (matches.TryGetValue("bServerSku", out uint bs)) result.BServerSku = bs;
-                if (matches.TryGetValue("lMaxUserSessions", out uint lm)) result.LMaxUserSessions = lm;
-                if (matches.TryGetValue("bAppServerAllowed", out uint ba)) result.BAppServerAllowed = ba;
-                if (matches.TryGetValue("bRemoteConnAllowed", out uint br)) result.BRemoteConnAllowed = br;
-                if (matches.TryGetValue("bMultimonAllowed", out uint bm)) result.BMultimonAllowed = bm;
-                if (matches.TryGetValue("ulMaxDebugSessions", out uint ul)) result.UlMaxDebugSessions = ul;
-                if (matches.TryGetValue("bFUSEnabled", out uint bf)) result.BFUSEnabled = bf;
-
-                foreach (var kvp in matches)
-                {
-                    Log($"    {kvp.Key} = 0x{kvp.Value:X}");
-                    report.AppendLine($"  {kvp.Key}: 0x{kvp.Value:X}");
-                }
-                return;
-            }
-        }
-
-        // Fallback: just assign in order
-        Log("[!] Could not match SLInit data to standard layout. Using sequential assignment.");
-        if (offsets.Count >= 8)
-        {
-            result.BInitialized = offsets[0].rva;
-            result.BServerSku = offsets[1].rva;
-            result.LMaxUserSessions = offsets[2].rva;
-            result.BAppServerAllowed = offsets[3].rva;
-            result.BRemoteConnAllowed = offsets[4].rva;
-            result.BMultimonAllowed = offsets[5].rva;
-            result.UlMaxDebugSessions = offsets[6].rva;
-            result.BFUSEnabled = offsets[7].rva;
-        }
-    }
+    // BlockInData removed: superseded by E8-anchored SLInit scoring (block end check done in VerifySLInit).
 
     /// <summary>
-    /// Find SingleUserOffset - the byte to patch in CSessionArbitrationHelper::IsSingleSessionPerUserEnabled.
-    /// The patch changes a 01 byte to 00 (Zero), making the function return false instead of true.
-    /// Pattern: B0 01 C3 (mov al, 1; ret) -> patch the 01 byte
+    /// Find the start of the function containing refOffset by scanning backwards
+    /// for a prologue or an int3-padded function boundary.
     /// </summary>
-    private uint FindSingleUserOffset(PEAnalyzer pe)
+    private uint FindFunctionStart(PEAnalyzer pe, int refOffset, int searchStart)
     {
-        if (pe.TextSection == null) return 0;
-
-        int codeStart = (int)pe.TextSection.RawDataOffset;
-        int codeSize = (int)pe.TextSection.RawDataSize;
-
-        // Strategy 1: Search for B0 01 C3 (mov al, 1; ret) preceded by function boundary
-        // This is a small leaf function that returns true
-        byte[] b001c3 = { 0xB0, 0x01, 0xC3 };
-        var candidates = pe.FindAllPatterns(b001c3, codeStart, codeSize);
-        Log($"[*] Found {candidates.Count} B0 01 C3 patterns");
-
-        foreach (var candidate in candidates)
+        for (int i = refOffset; i >= Math.Max(searchStart, refOffset - 512); i--)
         {
-            // Check if preceded by CC (int3 padding) or C3 (ret) - function boundary
-            bool isFunctionBoundary = false;
-            if (candidate > codeStart)
+            // int3 padding run followed by a valid prologue = strongest boundary signal
+            if (OffsetVerifier.IsValidPrologue(pe, i))
             {
-                byte prev = pe.ReadByte(candidate - 1);
-                if (prev == 0xCC) isFunctionBoundary = true;
-                if (prev == 0xC3 && candidate > codeStart + 1)
-                {
-                    byte prev2 = pe.ReadByte(candidate - 2);
-                    // Check if prev is actually a ret (not part of another instruction)
-                    // Common patterns before ret: 48 83 C4 XX (add rsp, XX) or CC
-                    if (prev2 == 0xC3 || prev2 == 0xCC || prev2 == 0x24 || prev2 == 0x28) isFunctionBoundary = true;
-                }
-            }
-
-            if (isFunctionBoundary)
-            {
-                // The patch byte is the 01 at candidate+1
-                uint patchRVA = pe.OffsetToRVA(candidate + 1);
-                Log($"[+] Found SingleUserOffset: 0x{patchRVA:X} (B0 01 C3 at 0x{pe.OffsetToRVA(candidate):X})");
-                return patchRVA;
+                // prefer prologue directly after CC padding
+                if (i > searchStart && pe.ReadByte(i - 1) == 0xCC)
+                    return pe.OffsetToRVA(i);
             }
         }
-
-        // Strategy 2: Search for B0 01 followed by C3 within 0-8 bytes (longer function)
-        byte[] b001 = { 0xB0, 0x01 };
-        var b001Matches = pe.FindAllPatterns(b001, codeStart, codeSize);
-        foreach (var match in b001Matches)
+        // second pass: any prologue
+        for (int i = refOffset; i >= Math.Max(searchStart, refOffset - 512); i--)
         {
-            // Check if C3 (ret) appears within 0-8 bytes after B0 01
-            for (int i = 2; i <= 10 && match + i < codeStart + codeSize; i++)
-            {
-                if (pe.ReadByte(match + i) == 0xC3)
-                {
-                    // Found B0 01 ... C3 - check for function boundary before B0 01
-                    if (match > codeStart)
-                    {
-                        byte prev = pe.ReadByte(match - 1);
-                        if (prev == 0xCC)
-                        {
-                            uint patchRVA = pe.OffsetToRVA(match + 1);
-                            Log($"[+] Found SingleUserOffset (strategy 2): 0x{patchRVA:X}");
-                            return patchRVA;
-                        }
-                    }
-                    break;
-                }
-                // Skip over common instructions between B0 01 and C3
-                // e.g., 48 83 C4 28 (add rsp, 28h) before ret
-            }
+            if (OffsetVerifier.IsValidPrologue(pe, i))
+                return pe.OffsetToRVA(i);
         }
-
-        // Strategy 3: Search for 33 C0 40 C3 (xor eax, eax; inc eax; ret) - returns 1
-        byte[] xorInc = { 0x33, 0xC0, 0x40, 0xC3 };
-        var xorMatches = pe.FindAllPatterns(xorInc, codeStart, codeSize);
-        foreach (var match in xorMatches)
-        {
-            if (match > codeStart && pe.ReadByte(match - 1) == 0xCC)
-            {
-                // The 40 (inc eax) byte should be patched to 90 (nop) to return 0
-                // But SingleUserCode=Zero means patch to 00, so this pattern needs different handling
-                // Skip for now
-            }
-        }
-
-        Log("[-] SingleUserOffset not found via pattern search.");
         return 0;
     }
 
-    /// <summary>
-    /// Find LocalOnlyOffset - the conditional jump to patch in GetInstanceOfTSLicense.
-    /// </summary>
-    private uint FindLocalOnlyOffset(PEAnalyzer pe)
-    {
-        if (pe.TextSection == null) return 0;
+    // =====================================================================
+    // INI generation
+    // =====================================================================
 
-        int codeStart = (int)pe.TextSection.RawDataOffset;
-        int codeSize = (int)pe.TextSection.RawDataSize;
-
-        // Search for "LocalOnly" or "TSLicense" strings
-        string[] searchStrings = { "LocalOnly", "TSLicense", "GetInstanceOf" };
-
-        foreach (var s in searchStrings)
-        {
-            byte[] searchString = Encoding.Unicode.GetBytes(s);
-            int strPos = pe.FindPattern(searchString, 0);
-            if (strPos < 0)
-            {
-                searchString = Encoding.ASCII.GetBytes(s);
-                strPos = pe.FindPattern(searchString, 0);
-            }
-
-            if (strPos <= 0) continue;
-
-            uint strRVA = pe.OffsetToRVA(strPos);
-            Log($"[*] Found '{s}' string at RVA 0x{strRVA:X}");
-
-            // Search for LEA references to this string
-            byte[] leaPattern = { 0x48, 0x8D, 0x0D };
-            var leaMatches = pe.FindAllPatterns(leaPattern, codeStart, codeSize);
-
-            foreach (var match in leaMatches)
-            {
-                int disp = (int)pe.ReadUInt32(match + 3);
-                uint instRVA = pe.OffsetToRVA(match);
-                uint targetRVA = (uint)(instRVA + 7 + disp);
-
-                if (targetRVA == strRVA)
-                {
-                    uint funcStart = FindFunctionStart(pe, match, codeStart);
-                    if (funcStart > 0)
-                    {
-                        // Search for conditional jumps in this function
-                        int funcOffset = (int)pe.RVAToOffset(funcStart);
-                        for (int i = funcOffset; i < funcOffset + 512 && i < codeStart + codeSize; i++)
-                        {
-                            byte b = pe.ReadByte(i);
-                            // Conditional jumps: 74 (jz), 75 (jnz), 84 (jz), 85 (jnz)
-                            // These are 2-byte short jumps
-                            if (b == 0x74 || b == 0x75)
-                            {
-                                // Found a conditional jump - this is a candidate for the patch
-                                return pe.OffsetToRVA(i);
-                            }
-                            // Also check 0F 84/85 (long conditional jumps)
-                            if (b == 0x0F && i + 1 < codeStart + codeSize)
-                            {
-                                byte b2 = pe.ReadByte(i + 1);
-                                if (b2 == 0x84 || b2 == 0x85)
-                                {
-                                    return pe.OffsetToRVA(i);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return 0;
-    }
-
-    /// <summary>
-    /// Generate INI section content from analysis result.
-    /// </summary>
+    /// <summary>Generate INI sections for EVERY version alias (section-name robustness).</summary>
     public string GenerateIniSection(AnalysisResult result)
     {
         var sb = new StringBuilder();
-
-        // Main version section
-        sb.AppendLine($"[{result.Version}]");
-
-        if (result.LocalOnlyOffset > 0)
+        var names = result.Aliases.Count > 0 ? result.Aliases : new List<string> { result.Version };
+        for (int i = 0; i < names.Count; i++)
         {
-            sb.AppendLine("LocalOnlyPatch.x64=1");
-            sb.AppendLine($"LocalOnlyOffset.x64={result.LocalOnlyOffset:X}");
-            sb.AppendLine("LocalOnlyCode.x64=jmpshort");
+            if (i > 0) sb.AppendLine($"; alias section - same binary, alternate version resource value");
+            AppendOneSection(sb, names[i], result);
         }
-
-        if (result.SingleUserOffset > 0)
-        {
-            sb.AppendLine("SingleUserPatch.x64=1");
-            sb.AppendLine($"SingleUserOffset.x64={result.SingleUserOffset:X}");
-            sb.AppendLine("SingleUserCode.x64=Zero");
-        }
-
-        if (result.DefPolicyOffset > 0)
-        {
-            sb.AppendLine("DefPolicyPatch.x64=1");
-            sb.AppendLine($"DefPolicyOffset.x64={result.DefPolicyOffset:X}");
-            sb.AppendLine("DefPolicyCode.x64=CDefPolicy_Query_eax_rcx");
-        }
-
-        if (result.SLInitOffset > 0)
-        {
-            sb.AppendLine("SLInitHook.x64=1");
-            sb.AppendLine($"SLInitOffset.x64={result.SLInitOffset:X}");
-            sb.AppendLine("SLInitFunc.x64=New_CSLQuery_Initialize");
-        }
-
-        // SLInit data section
-        if (result.BInitialized > 0)
-        {
-            sb.AppendLine();
-            sb.AppendLine($"[{result.Version}-SLInit]");
-            sb.AppendLine($"bInitialized.x64 ={result.BInitialized:X}");
-            sb.AppendLine($"bServerSku.x64 ={result.BServerSku:X}");
-            sb.AppendLine($"lMaxUserSessions.x64 ={result.LMaxUserSessions:X}");
-            sb.AppendLine($"bAppServerAllowed.x64 ={result.BAppServerAllowed:X}");
-            sb.AppendLine($"bRemoteConnAllowed.x64={result.BRemoteConnAllowed:X}");
-            sb.AppendLine($"bMultimonAllowed.x64 ={result.BMultimonAllowed:X}");
-            sb.AppendLine($"ulMaxDebugSessions.x64={result.UlMaxDebugSessions:X}");
-            sb.AppendLine($"bFUSEnabled.x64 ={result.BFUSEnabled:X}");
-        }
-
         return sb.ToString();
     }
 
-    /// <summary>
-    /// Full analysis + INI generation in one step.
-    /// </summary>
+    private void AppendOneSection(StringBuilder sb, string version, AnalysisResult result)
+    {
+        var (body, slInit) = BuildSectionBodies(result);
+        sb.AppendLine($"[{version}]");
+        sb.AppendLine(body);
+        sb.AppendLine();
+        sb.AppendLine($"[{version}-SLInit]");
+        sb.AppendLine(slInit);
+        sb.AppendLine();
+    }
+
+    /// <summary>Section bodies WITHOUT headers - used by IniManager.AddVersionSections.</summary>
+    public (string sectionContent, string slInitContent) BuildSectionBodies(AnalysisResult result)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("LocalOnlyPatch.x64=1");
+        sb.AppendLine($"LocalOnlyOffset.x64={result.LocalOnlyOffset:X}");
+        sb.AppendLine($"LocalOnlyCode.x64={result.LocalOnlyCode}");
+        sb.AppendLine("SingleUserPatch.x64=1");
+        sb.AppendLine($"SingleUserOffset.x64={result.SingleUserOffset:X}");
+        sb.AppendLine($"SingleUserCode.x64={result.SingleUserCode}");
+        sb.AppendLine("DefPolicyPatch.x64=1");
+        sb.AppendLine($"DefPolicyOffset.x64={result.DefPolicyOffset:X}");
+        sb.AppendLine($"DefPolicyCode.x64={result.DefPolicyCode}");
+        sb.AppendLine("SLInitHook.x64=1");
+        sb.AppendLine($"SLInitOffset.x64={result.SLInitOffset:X}");
+        sb.Append("SLInitFunc.x64=New_CSLQuery_Initialize");
+
+        var sd = new StringBuilder();
+        sd.AppendLine($"bInitialized.x64      ={result.BInitialized:X}");
+        sd.AppendLine($"bServerSku.x64        ={result.BServerSku:X}");
+        sd.AppendLine($"lMaxUserSessions.x64  ={result.LMaxUserSessions:X}");
+        sd.AppendLine($"bAppServerAllowed.x64 ={result.BAppServerAllowed:X}");
+        sd.AppendLine($"bRemoteConnAllowed.x64={result.BRemoteConnAllowed:X}");
+        sd.AppendLine($"bMultimonAllowed.x64  ={result.BMultimonAllowed:X}");
+        sd.AppendLine($"ulMaxDebugSessions.x64={result.UlMaxDebugSessions:X}");
+        sd.Append($"bFUSEnabled.x64       ={result.BFUSEnabled:X}");
+        return (sb.ToString(), sd.ToString());
+    }
+
+    /// <summary>Patch codes required by this analysis result (for [PatchCodes] section).</summary>
+    public List<string> GetRequiredPatchCodes(AnalysisResult result)
+    {
+        var codes = new List<string> { result.LocalOnlyCode, result.SingleUserCode, result.DefPolicyCode };
+        return codes.Where(c => !string.IsNullOrEmpty(c)).Distinct().ToList();
+    }
+
+    /// <summary>Full analysis + INI generation in one step.</summary>
     public (bool success, string iniSection, string report) AnalyzeAndGenerate(string? termsrvPath = null)
     {
         var result = Analyze(termsrvPath);
-        if (!result.Success && result.DefPolicyOffset == 0 && result.SLInitOffset == 0)
+        if (!result.Success)
         {
-            return (false, "", result.Report + "\n\nAuto-analysis failed. Could not find critical patch offsets.");
+            return (false, "", result.Report + "\nAuto-analysis failed strict verification. INI was NOT modified.");
         }
-
         string iniSection = GenerateIniSection(result);
         return (true, iniSection, result.Report);
     }
+
+    /// <summary>Analyze and return the rich result object (used by the one-click flow).</summary>
+    public AnalysisResult AnalyzeEx(string? termsrvPath = null) => Analyze(termsrvPath);
 }

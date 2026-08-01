@@ -204,10 +204,25 @@ public class ServiceManager
     }
 
     /// <summary>
-    /// Restart a service.
+    /// Restart a service. For TermService, stops the dependent UmRdpService first:
+    /// TermService's stop wait-hint can be up to 60s while UmRdpService holds it.
     /// </summary>
     public static bool RestartService(string serviceName, int timeoutMs = 20000)
     {
+        if (serviceName.Equals(TermServiceName, StringComparison.OrdinalIgnoreCase))
+        {
+            try
+            {
+                using var um = new ServiceController("UmRdpService");
+                if (um.Status == ServiceControllerStatus.Running)
+                {
+                    LogMessage("[*] 先停止依赖服务 UmRdpService...");
+                    um.Stop();
+                    um.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromMilliseconds(8000));
+                }
+            }
+            catch { /* best effort */ }
+        }
         StopService(serviceName, timeoutMs);
         System.Threading.Thread.Sleep(1000);
         return StartService(serviceName, timeoutMs);
@@ -342,7 +357,7 @@ public class ServiceManager
                 try
                 {
                     var lines = File.ReadAllLines(logPath);
-                    var lastLines = lines.Length > 30 ? lines[^30..] : lines;
+                    var lastLines = lines.Length > 30 ? lines.Skip(lines.Length - 30).ToArray() : lines;
                     LogMessage("--- rdpwrap.txt (最后30行) ---");
                     foreach (var line in lastLines)
                         LogMessage($"  {line}");

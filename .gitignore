@@ -1,22 +1,29 @@
-# Build output
-**/bin/
-**/obj/
-.vs/
-*.user
-*.suo
+# Build outputs
+src/**/bin/
+src/**/obj/
+bin/Debug/
+bin/Release/
 
-# Portable runtime and release artifacts
-app/
-dist/
+# Debug symbols and native build artifacts
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.iobj
+*.ipdb
+*.pch
+*.obj
+*.tlog
 
-# Local diagnostics and backups
-*.log
-*.bak
-*.tmp
-*.dmp
+# Temporary analysis/test files
+temp_analyze/
+analyze_smoke.txt
+temp_*.ps1
+find_localonly.ps1
+analyze_termsrv.cs
+termsrv.dll
+widows10/
 
-# OS/editor files
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
+# Keep the release exe in the root publish folder
+!bin/
+!bin/RDPWrapTool.exe
