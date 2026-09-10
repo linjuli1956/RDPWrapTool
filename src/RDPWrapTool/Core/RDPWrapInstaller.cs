@@ -258,10 +258,14 @@ public class RDPWrapInstaller
     /// Deploy/update rdpwrap.dll and rdpwrap.ini to System32 without full install.
     /// Use when RDPWrap is already installed and you just need to push updated files
     /// (e.g. after auto-analysis added a new version section to the local INI).
-    /// Stops TermService, copies both files, ensures ServiceDll registry, restarts.
+    ///
+    /// The returned result reports whether RDP actually works afterwards (listener up,
+    /// no "RDS failed to start" event, patches visible in the rdpwrap log) - not merely
+    /// whether the service reported Running.
     /// </summary>
-    public bool DeployFilesOnly()
+    public DeployResult DeployFilesOnly(bool verify = true, bool requirePatches = true)
     {
+        var result = new DeployResult();
         string srcDll = Path.Combine(_toolDir, "rdpwrap.dll");
         string srcIni = Path.Combine(_toolDir, "rdpwrap.ini");
         string dstDll = Path.Combine(_system32Dir, "rdpwrap.dll");
@@ -269,15 +273,18 @@ public class RDPWrapInstaller
 
         if (!File.Exists(srcDll))
         {
-            Log($"[-] rdpwrap.dll not found in tool directory: {srcDll}");
-            return false;
+            result.Message = $"rdpwrap.dll not found in tool directory: {srcDll}";
+            Log($"[-] {result.Message}");
+            return result;
         }
         if (!File.Exists(srcIni))
         {
-            Log($"[-] rdpwrap.ini not found in tool directory: {srcIni}");
-            return false;
+            result.Message = $"rdpwrap.ini not found in tool directory: {srcIni}";
+            Log($"[-] {result.Message}");
+            return result;
         }
 
+        var deployStart = DateTime.Now;
         try
         {
             Log("[*] 正在停止 TermService...");
@@ -288,28 +295,59 @@ public class RDPWrapInstaller
             File.Copy(srcDll, dstDll, true);
             Log("[*] 正在部署 rdpwrap.ini 到 System32...");
             File.Copy(srcIni, dstIni, true);
+            result.FilesDeployed = true;
 
             // Ensure ServiceDll registry points to rdpwrap.dll
             Log("[*] 确认 ServiceDll 注册表...");
             SetWrapperDll(dstDll);
 
+            // Make sure the DLL's diagnostics land in a writable file before restarting.
+            if (IniManager.EnsureLogDirectory())
+                Log($"[*] rdpwrap 日志目录已就绪: {IniManager.DefaultLogPath}");
+            else
+                Log("[!] 无法为 rdpwrap 日志目录授权，DLL 诊断可能不可用。");
+            try { if (File.Exists(IniManager.DefaultLogPath)) File.Delete(IniManager.DefaultLogPath); } catch { }
+
             Log("[*] 正在启动 TermService...");
-            bool started = ServiceManager.StartService(ServiceManager.TermServiceName);
-            if (!started)
+            ServiceManager.StartService(ServiceManager.TermServiceName);
+
+            if (!verify)
             {
-                Log("[-] TermService 启动失败！");
-                ServiceManager.DiagnoseTermServiceFailure();
+                result.Success = ServiceManager.GetServiceStatus(ServiceManager.TermServiceName)
+                    == System.ServiceProcess.ServiceControllerStatus.Running;
+                result.Stage = "unverified";
+                result.Message = "文件已部署（未做监听校验）";
+                return result;
+            }
+
+            Log("[*] 正在校验 RDP 监听状态与补丁日志...");
+            var verification = DeployVerifier.Verify(deployStart.AddSeconds(-2), requirePatches, Log);
+            result.PortListening = verification.PortListening;
+            result.ListenerEvent = verification.ListenerEvent;
+            result.StartupFailed = verification.StartupFailed;
+            result.PatchesApplied = verification.PatchesApplied;
+            result.SlInitWritten = verification.SlInitWritten;
+            result.Success = verification.Success;
+            result.Evidence.AddRange(verification.Evidence);
+            result.Stage = verification.Success ? "full" : "failed";
+
+            if (verification.Success)
+            {
+                Log("[+] 部署完成并校验通过：3389 正在侦听，补丁已写入。");
             }
             else
             {
-                Log("[+] 部署完成，TermService 已重启。");
+                result.Message = "部署后校验未通过：RDP 监听未就绪。";
+                Log($"[-] {result.Message} {result.Describe()}");
+                ServiceManager.DiagnoseTermServiceFailure();
             }
-            return started;
+            return result;
         }
         catch (Exception ex)
         {
-            Log($"[-] Deploy error: {ex.Message}");
-            return false;
+            result.Message = "Deploy error: " + ex.Message;
+            Log($"[-] {result.Message}");
+            return result;
         }
     }
 

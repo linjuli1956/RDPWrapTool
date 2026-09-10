@@ -24,6 +24,14 @@ analyze_termsrv.cs
 termsrv.dll
 widows10/
 
+# Runtime working files next to the exe (auto-created / auto-modified)
+bin/rdpwrap.dll
+bin/rdpwrap.ini
+bin/rdpwrap.ini.bak*
+bin/rdpwrap.ini.pre-restore-*
+bin/rdpwrap.generated.txt
+analyze_output.txt
+
 # Keep the release exe in the root publish folder
 !bin/
 !bin/RDPWrapTool.exe

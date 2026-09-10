@@ -177,19 +177,34 @@ public class ServiceManager
     }
 
     /// <summary>
-    /// Stop a service. Tries ServiceController first, then kills the process.
+    /// Stop a service. Tries a graceful stop first; only if that times out does it fall
+    /// back to terminating the hosting process (which is shared with every other service
+    /// in the same svchost group, hence the explicit warning), and it always waits for the
+    /// old process to disappear before the caller restarts the service - restarting into a
+    /// still-dying host is what produces "RDS failed to start 0x800706BA".
     /// </summary>
     public static bool StopService(string serviceName, int timeoutMs = 15000)
     {
+        uint? pidBefore = GetServiceProcessId(serviceName);
+
         try
         {
             using var sc = new ServiceController(serviceName);
             if (sc.Status == ServiceControllerStatus.Stopped)
                 return true;
             sc.Stop();
-            sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromMilliseconds(timeoutMs));
+            try
+            {
+                sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromMilliseconds(timeoutMs));
+            }
+            catch (System.ServiceProcess.TimeoutException) { /* fall through to the kill path */ }
+            sc.Refresh();
             if (sc.Status == ServiceControllerStatus.Stopped)
+            {
+                if (pidBefore.HasValue) WaitForProcessExit(pidBefore.Value, 10000);
                 return true;
+            }
+            LogMessage($"[!] {serviceName} 未在 {timeoutMs / 1000}s 内正常停止，改用强制终止。");
         }
         catch (Exception ex)
         {
@@ -197,10 +212,33 @@ public class ServiceManager
         }
 
         // Fallback: kill the process
+        LogMessage($"[!] 注意: 强杀 svchost 会同时终止与其同组的其它服务（PID {(pidBefore?.ToString() ?? "?")}）。");
         LogMessage($"[*] 尝试强制终止 {serviceName} 进程...");
         KillTermService();
-        System.Threading.Thread.Sleep(2000);
+        if (pidBefore.HasValue) WaitForProcessExit(pidBefore.Value, 15000);
+        else System.Threading.Thread.Sleep(2000);
         return GetServiceStatus(serviceName) == ServiceControllerStatus.Stopped;
+    }
+
+    /// <summary>Wait until a process id no longer exists (or the timeout expires).</summary>
+    public static bool WaitForProcessExit(uint pid, int timeoutMs = 10000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            try
+            {
+                using var p = Process.GetProcessById((int)pid);
+                if (p.HasExited) return true;
+            }
+            catch
+            {
+                return true; // no longer running
+            }
+            System.Threading.Thread.Sleep(250);
+        }
+        LogMessage($"[!] PID {pid} 在 {timeoutMs / 1000}s 内仍未退出。");
+        return false;
     }
 
     /// <summary>
@@ -325,6 +363,139 @@ public class ServiceManager
     public static event Action<string>? OnLog;
     private static void LogMessage(string msg) => OnLog?.Invoke(msg);
 
+    // =====================================================================
+    // RDP readiness / evidence
+    // =====================================================================
+
+    /// <summary>RDP listener channel: id 258 = "listener RDP-Tcp started listening".</summary>
+    public const string RcmLog = "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational";
+    public const int RcmListenerStartedId = 258;
+
+    /// <summary>Session manager channel: id 17 = "Remote Desktop Services failed to start".</summary>
+    public const string LsmLog = "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational";
+    public const int LsmStartupFailedId = 17;
+
+    /// <summary>Startup evidence collected from the TerminalServices event channels.</summary>
+    public sealed class TsStartupEvidence
+    {
+        public bool ListenerStarted;
+        public bool StartupFailed;
+        public DateTime? ListenerStartedAt;
+        public DateTime? StartupFailedAt;
+        public List<string> Messages { get; } = new();
+        public List<string> Notes { get; } = new();
+    }
+
+    /// <summary>
+    /// Is anything listening on the RDP port? This is the only reliable "the wrapper
+    /// actually works" signal: the SCM reports TermService as Running even when termsrv
+    /// failed to create its listener.
+    /// </summary>
+    public static bool IsRdpPortListening(int port = 3389)
+    {
+        try
+        {
+            var listeners = System.Net.NetworkInformation.IPGlobalProperties.GetIPGlobalProperties()
+                .GetActiveTcpListeners();
+            return listeners.Any(ep => ep.Port == port);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>Can we actually open a TCP connection to the RDP listener?</summary>
+    public static bool CanConnectRdp(string host = "127.0.0.2", int port = 3389, int timeoutMs = 3000)
+    {
+        try
+        {
+            using var client = new System.Net.Sockets.TcpClient();
+            var ar = client.BeginConnect(host, port, null, null);
+            if (!ar.AsyncWaitHandle.WaitOne(timeoutMs)) return false;
+            client.EndConnect(ar);
+            return client.Connected;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Wait until TermService is Running *and* the RDP listener is up. The listener is
+    /// created a moment after the service reports Running, so polling is required.
+    /// </summary>
+    public static bool WaitServiceReady(int timeoutMs = 25000, bool requireListener = true)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        bool sawRunning = false;
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            if (GetServiceStatus(TermServiceName) == ServiceControllerStatus.Running)
+            {
+                sawRunning = true;
+                if (!requireListener || IsRdpPortListening()) return true;
+            }
+            System.Threading.Thread.Sleep(500);
+        }
+        LogMessage(sawRunning
+            ? $"[!] TermService 已 Running，但 {timeoutMs / 1000}s 内 3389 仍未开始侦听。"
+            : $"[!] TermService 在 {timeoutMs / 1000}s 内未进入 Running。");
+        return false;
+    }
+
+    /// <summary>
+    /// Read the TerminalServices channels for startup evidence. Event IDs are locale
+    /// independent (258 = listener started, 17 = RDS failed to start), so this works on
+    /// Chinese/English installations alike.
+    /// </summary>
+    public static TsStartupEvidence GetTsStartupEvidence(DateTime sinceLocal)
+    {
+        var ev = new TsStartupEvidence();
+        string sinceUtc = sinceLocal.ToUniversalTime().ToString("o");
+
+        ReadEvents(RcmLog, RcmListenerStartedId, sinceUtc, rec =>
+        {
+            ev.ListenerStarted = true;
+            if (rec.TimeCreated.HasValue && (ev.ListenerStartedAt == null || rec.TimeCreated > ev.ListenerStartedAt))
+                ev.ListenerStartedAt = rec.TimeCreated;
+            ev.Messages.Add($"[258] {rec.TimeCreated:HH:mm:ss} 侦听程序 RDP-Tcp 已开始侦听");
+            return true;
+        }, ev);
+
+        ReadEvents(LsmLog, LsmStartupFailedId, sinceUtc, rec =>
+        {
+            ev.StartupFailed = true;
+            if (rec.TimeCreated.HasValue && (ev.StartupFailedAt == null || rec.TimeCreated > ev.StartupFailedAt))
+                ev.StartupFailedAt = rec.TimeCreated;
+            ev.Messages.Add($"[17]  {rec.TimeCreated:HH:mm:ss} 远程桌面服务启动失败");
+            return true;
+        }, ev);
+
+        return ev;
+    }
+
+    private static void ReadEvents(string logName, int eventId, string sinceUtc,
+        Func<System.Diagnostics.Eventing.Reader.EventRecord, bool> onRecord, TsStartupEvidence ev)
+    {
+        try
+        {
+            string xpath = $"*[System[(EventID={eventId}) and TimeCreated[@SystemTime>='{sinceUtc}']]]";
+            var query = new System.Diagnostics.Eventing.Reader.EventLogQuery(
+                logName, System.Diagnostics.Eventing.Reader.PathType.LogName, xpath);
+            using var reader = new System.Diagnostics.Eventing.Reader.EventLogReader(query);
+            for (var rec = reader.ReadEvent(); rec != null; rec = reader.ReadEvent())
+            {
+                if (!onRecord(rec)) break;
+            }
+        }
+        catch (Exception ex)
+        {
+            ev.Notes.Add($"无法读取 {logName} (id={eventId}): {ex.Message}");
+        }
+    }
+
     /// <summary>
     /// Diagnose why TermService failed to start. Checks rdpwrap.txt log, event log, DLL architecture.
     /// </summary>
@@ -344,29 +515,42 @@ public class ServiceManager
             LogMessage($"[-] 无法获取服务状态: {ex.Message}");
         }
 
-        // 2. Check rdpwrap.txt log (created by rdpwrap.dll)
+        // 2. rdpwrap.dll log (path written into [Main] LogFile by the tool)
         string[] logPaths = {
+            IniManager.DefaultLogPath,
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "rdpwrap.txt"),
-            Path.Combine(AppContext.BaseDirectory, "rdpwrap.txt")
+            Path.Combine(AppContext.BaseDirectory, "rdpwrap.txt"),
+            @"C:\rdpwrap.txt"
         };
-        foreach (var logPath in logPaths)
+        bool anyLog = false;
+        foreach (var logPath in logPaths.Distinct())
         {
-            if (File.Exists(logPath))
+            if (!File.Exists(logPath)) continue;
+            anyLog = true;
+            LogMessage($"[*] 找到 RDPWrap 日志: {logPath}");
+            try
             {
-                LogMessage($"[*] 找到 RDPWrap 日志: {logPath}");
-                try
-                {
-                    var lines = File.ReadAllLines(logPath);
-                    var lastLines = lines.Length > 30 ? lines.Skip(lines.Length - 30).ToArray() : lines;
-                    LogMessage("--- rdpwrap.txt (最后30行) ---");
-                    foreach (var line in lastLines)
-                        LogMessage($"  {line}");
-                }
-                catch { }
+                var lines = File.ReadAllLines(logPath);
+                var lastLines = lines.Length > 40 ? lines.Skip(lines.Length - 40).ToArray() : lines;
+                LogMessage("--- rdpwrap.txt (最后40行) ---");
+                foreach (var line in lastLines)
+                    LogMessage($"  {line}");
             }
+            catch { }
         }
-        if (!logPaths.Any(File.Exists))
-            LogMessage("[-] 未找到 rdpwrap.txt 日志文件 (DLL可能未被加载)");
+        if (!anyLog)
+            LogMessage("[-] 未找到 rdpwrap.txt 日志文件 (DLL 未加载，或 [Main] LogFile 指向服务账户写不了的路径)");
+
+        // 2b. Listener + TerminalServices startup evidence (locale independent)
+        LogMessage($"[*] 3389 监听中: {(IsRdpPortListening() ? "是" : "否")}");
+        var evidence = GetTsStartupEvidence(DateTime.Now.AddMinutes(-30));
+        foreach (var note in evidence.Notes) LogMessage($"  [!] {note}");
+        if (evidence.ListenerStarted)
+            LogMessage($"[*] 最近 30 分钟侦听程序启动记录: {evidence.ListenerStartedAt:HH:mm:ss}");
+        else
+            LogMessage("[-] 最近 30 分钟没有「侦听程序 RDP-Tcp 已开始侦听」(事件 258)");
+        if (evidence.StartupFailed)
+            LogMessage($"[-] 最近 30 分钟有「远程桌面服务启动失败」(事件 17): {evidence.StartupFailedAt:HH:mm:ss}");
 
         // 3. Check rdpwrap.dll exists and architecture
         string dllPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "rdpwrap.dll");

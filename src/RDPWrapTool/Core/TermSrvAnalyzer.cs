@@ -25,6 +25,12 @@ public class TermSrvAnalyzer
     public event Action<string>? OnLog;
     private void Log(string msg) => OnLog?.Invoke(msg);
 
+    /// <summary>
+    /// Test/diagnostic switch: ignore the WPP trace string names embedded in termsrv.dll and
+    /// fall back to known-layout + store-shape selection. Used by the regression CLI.
+    /// </summary>
+    public bool DisableWppNames { get; set; }
+
     public class AnalysisResult
     {
         public string Version { get; set; } = "";
@@ -46,6 +52,7 @@ public class TermSrvAnalyzer
         public uint SLInitOffset { get; set; }
         public string SlInitStrategy { get; set; } = "";
         public bool SlInitVerified { get; set; }
+        public SlInitResolution? SlInitResolution { get; set; }
 
         public uint BInitialized { get; set; }
         public uint BServerSku { get; set; }
@@ -496,23 +503,22 @@ public class TermSrvAnalyzer
                 var win = leaders[0];
                 Rep($"[+] SLInit winner: block=0x{win.block:X} hook=0x{win.hook:X} (distinctSlots={best}, unique)");
 
-                // Layout by build family (Win11 >=22000 -> A, Win10 -> B); the choice
-                // is verified: every one of the 8 slots must be referenced in .text.
-                int build = ParseBuild(result.Version);
-                var tries = build >= 22000
-                    ? new[] { (OffsetVerifier.SlInitLayoutA, OffsetVerifier.SlInitBlockSizeA, "A/Win11"), (OffsetVerifier.SlInitLayoutB, OffsetVerifier.SlInitBlockSizeB, "B/Win10") }
-                    : new[] { (OffsetVerifier.SlInitLayoutB, OffsetVerifier.SlInitBlockSizeB, "B/Win10"), (OffsetVerifier.SlInitLayoutA, OffsetVerifier.SlInitBlockSizeA, "A/Win11") };
-                var refTargets = new HashSet<uint>(refs.Select(r => r.target));
-                foreach (var (layout, blockSize, tag) in tries)
-                {
-                    if (!layout.All(kv => refTargets.Contains(win.block + (uint)kv.delta)))
-                    {
-                        Rep($"[!] layout {tag}: not all 8 slots referenced, trying fallback");
-                        continue;
-                    }
-                    if (AcceptSLInit(pe, win.hook, win.block, layout, blockSize, $"E8-scored/{tag}", result, Rep)) return;
-                }
-                Rep("[-] SLInit: winner found but no layout verified (strict).");
+                // The data block is DERIVED from this very function (never guessed from the
+                // build number): WPP trace strings name each global, and the store shape of
+                // every slot tells booleans from counts. See SlInitLayoutResolver.
+                int bodyIdx = bodies.FindIndex(bd => pe.OffsetToRVA(bd.start) == win.hook);
+                uint funcEndRva = bodyIdx >= 0 && bodies[bodyIdx].end > bodies[bodyIdx].start
+                    ? pe.OffsetToRVA(bodies[bodyIdx].end - 1) + 1
+                    : 0;
+                if (funcEndRva == 0)
+                    Rep("[!] could not determine the hooked function's end; using .text bounds");
+
+                var resolution = SlInitLayoutResolver.Resolve(pe, win.hook, funcEndRva, Rep, allowWppNames: !DisableWppNames);
+                foreach (var line in resolution.Evidence) Rep("    " + line);
+                if (resolution.Success && AcceptSLInit(pe, win.hook, resolution, result, Rep)) return;
+
+                if (!resolution.Success)
+                    Rep($"[-] SLInit layout could not be derived: {resolution.Reason}");
             }
             else
             {
@@ -593,23 +599,20 @@ public class TermSrvAnalyzer
         Rep($"    [dump] {label} @0x{rva:X}: {OffsetVerifier.Hex(pe, (int)off, len)}");
     }
 
-    private bool AcceptSLInit(PEAnalyzer pe, uint hookRva, uint baseRva,
-        (string name, int delta)[] layout, int blockSize, string strategy,
+    private bool AcceptSLInit(PEAnalyzer pe, uint hookRva, SlInitResolution resolution,
         AnalysisResult result, Action<string> Rep)
     {
-        var data = new Dictionary<string, uint>();
-        foreach (var kv in layout)
-            data[kv.name] = baseRva + (uint)kv.delta;
-
-        if (!OffsetVerifier.VerifySLInit(pe, hookRva, data, layout, blockSize, out string detail))
+        if (!OffsetVerifier.VerifySLInit(pe, hookRva, resolution, out string detail))
         {
             Rep($"[-] SLInit candidate hook=0x{hookRva:X} failed verification: {detail}");
             DumpAt(pe, hookRva, 16, "SLInit hook", Rep);
             return false;
         }
 
+        var data = resolution.Addresses;
         result.SLInitOffset = hookRva;
-        result.SlInitStrategy = strategy;
+        result.SlInitStrategy = resolution.Strategy;
+        result.SlInitResolution = resolution;
         result.BInitialized = data["bInitialized"];
         result.BServerSku = data["bServerSku"];
         result.LMaxUserSessions = data["lMaxUserSessions"];
@@ -619,7 +622,9 @@ public class TermSrvAnalyzer
         result.UlMaxDebugSessions = data["ulMaxDebugSessions"];
         result.BFUSEnabled = data["bFUSEnabled"];
         result.SlInitVerified = true;
-        Rep($"[+] SLInitOffset = 0x{hookRva:X} ({strategy}) VERIFIED: {detail}");
+        Rep($"[+] SLInitOffset = 0x{hookRva:X} ({resolution.Strategy}) VERIFIED: {detail}");
+        Rep($"    layout deltas: {resolution.LayoutString}" +
+            (resolution.MatchesKnownLayout ? "  (matches a community-verified layout)" : "  (derived, not in the known table)"));
         Rep($"    bInitialized=0x{result.BInitialized:X} bServerSku=0x{result.BServerSku:X} lMaxUserSessions=0x{result.LMaxUserSessions:X}");
         Rep($"    bAppServerAllowed=0x{result.BAppServerAllowed:X} bRemoteConnAllowed=0x{result.BRemoteConnAllowed:X} bMultimonAllowed=0x{result.BMultimonAllowed:X}");
         Rep($"    ulMaxDebugSessions=0x{result.UlMaxDebugSessions:X} bFUSEnabled=0x{result.BFUSEnabled:X}");

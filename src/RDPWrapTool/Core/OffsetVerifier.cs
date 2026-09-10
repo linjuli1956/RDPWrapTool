@@ -20,26 +20,11 @@ public static class OffsetVerifier
     public const string CodeDefPolicyEaxRcxJmp = "CDefPolicy_Query_eax_rcx_jmp";
     public const string CodeDefPolicyR9dRdiJmp = "CDefPolicy_Query_r9d_rdi_jmp";
 
-    // SLInit data layout: offset of each variable relative to bInitialized.
-    // LayoutA: Win11 (build >= 22000), byte-verified on 26100.8737 & 28000.2336.
-    public static readonly (string name, int delta)[] SlInitLayoutA =
-    {
-        ("bInitialized", 0), ("bServerSku", 4), ("lMaxUserSessions", 8),
-        ("bAppServerAllowed", 16), ("bRemoteConnAllowed", 24), ("bMultimonAllowed", 28),
-        ("ulMaxDebugSessions", 36), ("bFUSEnabled", 40)
-    };
-    // LayoutB: Win10 (build < 22000), byte-verified on 19041.6456.
-    public static readonly (string name, int delta)[] SlInitLayoutB =
-    {
-        ("bInitialized", 0), ("bServerSku", 4), ("lMaxUserSessions", 8),
-        ("bAppServerAllowed", 12), ("bRemoteConnAllowed", 24), ("bMultimonAllowed", 28),
-        ("ulMaxDebugSessions", 32), ("bFUSEnabled", 36)
-    };
-    public const int SlInitBlockSizeA = 44; // bFUSEnabled + 4
-    public const int SlInitBlockSizeB = 40;
-    // Legacy aliases (default = Win11 layout)
-    public static readonly (string name, int delta)[] SlInitLayout = SlInitLayoutA;
-    public const int SlInitBlockSize = SlInitBlockSizeA;
+    // NOTE: the SLInit data layout is NOT hard-coded here anymore. Real Windows builds use
+    // at least three different layouts (see SlInitLayoutResolver.KnownLayouts) and guessing
+    // from the build number produced INI sections that corrupted unrelated termsrv globals.
+    // The 8 addresses are now derived from the binary by SlInitLayoutResolver and verified
+    // by VerifySLInit below.
 
     public static string Hex(PEAnalyzer pe, int fileOff, int len)
     {
@@ -213,21 +198,29 @@ public static class OffsetVerifier
 
     /// <summary>
     /// Verify the SLInit hook offset and data block.
-    /// hookRva must point at a function prologue; all 8 data RVAs must be 4-aligned,
-    /// inside .data, and spaced exactly per the known layout.
+    /// hookRva must point at a function prologue and the 8 data RVAs must be the ones the
+    /// resolver proved are written by that very function (4-aligned, inside .data, unique,
+    /// and reachable from the bInitialized anchor).
     /// </summary>
-    public static bool VerifySLInit(PEAnalyzer pe, uint hookRva, IReadOnlyDictionary<string, uint> data, out string detail)
-        => VerifySLInit(pe, hookRva, data, SlInitLayoutA, SlInitBlockSizeA, out detail);
-
-    public static bool VerifySLInit(PEAnalyzer pe, uint hookRva, IReadOnlyDictionary<string, uint> data,
-        (string name, int delta)[] layout, int blockSize, out string detail)
+    public static bool VerifySLInit(PEAnalyzer pe, uint hookRva, SlInitResolution resolution, out string detail)
     {
         detail = "";
+        if (resolution == null || !resolution.Success)
+        {
+            detail = "no resolved SLInit layout: " + (resolution?.Reason ?? "resolver returned nothing");
+            return false;
+        }
+
         int off = CheckedOffset(pe, rva: hookRva, 3, out detail);
         if (off < 0) { detail = "hook: " + detail; return false; }
         if (!IsValidPrologue(pe, off))
         {
             detail = $"hook prologue invalid at 0x{hookRva:X} ({Hex(pe, off, 4)})";
+            return false;
+        }
+        if (hookRva != resolution.HookRva)
+        {
+            detail = $"hook RVA 0x{hookRva:X} does not match the analyzed function 0x{resolution.HookRva:X}";
             return false;
         }
 
@@ -237,42 +230,53 @@ public static class OffsetVerifier
             return false;
         }
 
-        foreach (var kv in layout)
+        uint baseRva = resolution.Addresses["bInitialized"];
+        var seen = new HashSet<uint>();
+        foreach (var name in SlInitLayoutResolver.NamedVariables.Prepend("bInitialized"))
         {
-            if (!data.TryGetValue(kv.name, out uint r) || r == 0)
+            if (!resolution.Addresses.TryGetValue(name, out uint r) || r == 0)
             {
-                detail = $"missing SLInit data: {kv.name}";
+                detail = $"missing SLInit data: {name}";
                 return false;
             }
             if ((r & 3) != 0)
             {
-                detail = $"{kv.name} RVA 0x{r:X} not 4-aligned";
+                detail = $"{name} RVA 0x{r:X} not 4-aligned";
                 return false;
             }
             if (!pe.DataSection.ContainsRVA(r))
             {
-                detail = $"{kv.name} RVA 0x{r:X} outside .data";
+                detail = $"{name} RVA 0x{r:X} outside .data";
                 return false;
             }
-        }
-
-        // Exact layout spacing check
-        uint baseRva = data["bInitialized"];
-        foreach (var kv in layout)
-        {
-            if (data[kv.name] - baseRva != (uint)kv.delta)
+            if (r < baseRva)
             {
-                detail = $"layout mismatch: {kv.name} at +{data[kv.name] - baseRva}, expect +{kv.delta}";
+                detail = $"{name} RVA 0x{r:X} below bInitialized 0x{baseRva:X}";
+                return false;
+            }
+            if (!seen.Add(r))
+            {
+                detail = $"duplicate SLInit RVA 0x{r:X}";
+                return false;
+            }
+            var store = resolution.StoreFor(r);
+            if (store == null)
+            {
+                detail = $"{name} RVA 0x{r:X} is never written inside the hooked function";
+                return false;
+            }
+            var expected = name is "lMaxUserSessions" or "ulMaxDebugSessions"
+                ? SlInitSlotKind.Count
+                : SlInitSlotKind.Bool;
+            if (name != "bInitialized" && store.Kind != expected)
+            {
+                detail = $"{name} store shape {store.Kind} != expected {expected}";
                 return false;
             }
         }
-        if (!pe.DataSection.ContainsRVA(baseRva + (uint)blockSize - 4))
-        {
-            detail = "SLInit block end outside .data";
-            return false;
-        }
 
-        detail = $"hook prologue OK ({Hex(pe, off, 4)}), data block 0x{baseRva:X}..0x{baseRva + (uint)blockSize - 4:X} in .data";
+        detail = $"hook prologue OK ({Hex(pe, off, 4)}), layout {resolution.LayoutString} " +
+                 $"({resolution.Strategy}), block 0x{baseRva:X}..0x{resolution.Addresses["bFUSEnabled"]:X} in .data";
         return true;
     }
 

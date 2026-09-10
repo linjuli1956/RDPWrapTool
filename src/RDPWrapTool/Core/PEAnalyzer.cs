@@ -43,6 +43,16 @@ public class PEAnalyzer : IDisposable
             return rva >= VirtualAddress && rva < VirtualAddress + VirtualSize;
         }
 
+        /// <summary>
+        /// True when the RVA is both inside the section and backed by real bytes in the
+        /// file. Sections like termsrv.dll's .data have VirtualSize &gt;&gt; RawSize, so the
+        /// virtual tail exists in memory but has no file content.
+        /// </summary>
+        public bool ContainsRVAInRawData(uint rva)
+        {
+            return ContainsRVA(rva) && (rva - VirtualAddress) < RawDataSize;
+        }
+
         public uint RVAToOffset(uint rva)
         {
             return rva - VirtualAddress + RawDataOffset;
@@ -179,14 +189,71 @@ public class PEAnalyzer : IDisposable
         }
     }
 
+    /// <summary>
+    /// Convert an RVA to a raw file offset. Returns 0 when the RVA is not backed by
+    /// file data (unmapped, or inside the virtual-only tail of a section such as
+    /// .data, whose RawSize is far smaller than its VirtualSize).
+    /// </summary>
     public uint RVAToOffset(uint rva)
     {
         foreach (var sec in Sections)
         {
-            if (sec.ContainsRVA(rva))
+            if (sec.ContainsRVAInRawData(rva))
                 return sec.RVAToOffset(rva);
         }
         return 0;
+    }
+
+    /// <summary>True when 'rva' is inside a section and backed by file bytes.</summary>
+    public bool IsMappedInFile(uint rva) => RVAToOffset(rva) != 0;
+
+    /// <summary>
+    /// Read a little-endian uint32 at an RVA. Returns 0 when the RVA has no file content.
+    /// </summary>
+    public uint ReadUInt32AtRva(uint rva)
+    {
+        uint off = RVAToOffset(rva);
+        if (off == 0 || off + 4 > _data.Length) return 0;
+        return BitConverter.ToUInt32(_data, (int)off);
+    }
+
+    /// <summary>
+    /// Find every NUL-terminated ANSI string that starts with 'prefix' and return its
+    /// RVA plus the full text. Used to read the WPP trace strings embedded in
+    /// termsrv.dll, which literally name the globals initialized by CSLQuery::Initialize
+    /// (e.g. "CSLQuery::Initialize - SLGetWindowsInformationDWORD for bRemoteConnAllowed").
+    /// </summary>
+    public List<(uint rva, string text)> FindAnsiStrings(string prefix, int maxLength = 200)
+    {
+        var results = new List<(uint, string)>();
+        if (string.IsNullOrEmpty(prefix)) return results;
+
+        byte[] pat = System.Text.Encoding.ASCII.GetBytes(prefix);
+        for (int i = 0; i + pat.Length < _data.Length; i++)
+        {
+            if (_data[i] != pat[0]) continue;
+            bool ok = true;
+            for (int j = 1; j < pat.Length; j++)
+            {
+                if (_data[i + j] != pat[j]) { ok = false; break; }
+            }
+            if (!ok) continue;
+
+            var sb = new System.Text.StringBuilder();
+            for (int k = i; k < _data.Length && k < i + maxLength; k++)
+            {
+                byte c = _data[k];
+                if (c == 0) break;
+                if (c < 0x20 || c > 0x7E) { sb.Clear(); break; }
+                sb.Append((char)c);
+            }
+            if (sb.Length == 0) continue;
+
+            uint rva = OffsetToRVA(i);
+            if (rva != 0) results.Add((rva, sb.ToString()));
+            i += pat.Length - 1;
+        }
+        return results;
     }
 
     /// <summary>

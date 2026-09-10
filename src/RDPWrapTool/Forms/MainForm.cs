@@ -41,6 +41,7 @@ public partial class MainForm : Form
     private Button _uninstallBtn = null!;
     private Button _enableRemoteBtn = null!;
     private Button _restartSvcBtn = null!;
+    private Button _restoreBtn = null!;
     private RichTextBox _installStatusBox = null!;
 
     // ===== Analyze page =====
@@ -290,19 +291,22 @@ public partial class MainForm : Form
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         // Big action buttons
-        var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 1 };
-        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 28));
+        var actions = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 5, RowCount = 1 };
         actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24));
-        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24));
-        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24));
+        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19));
+        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19));
+        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19));
+        actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 19));
         _installBtn = MakeActionButton("安装 RDPWrap", (s, e) => InstallRdpWrap());
         _uninstallBtn = MakeActionButton("卸载 RDPWrap", (s, e) => UninstallRdpWrap());
         _enableRemoteBtn = MakeActionButton("启用远程桌面", (s, e) => EnableRemoteDesktop());
         _restartSvcBtn = MakeActionButton("重启远程服务", (s, e) => RestartService());
+        _restoreBtn = MakeActionButton("恢复到可用状态", (s, e) => RestoreSafeState());
         actions.Controls.Add(_installBtn, 0, 0);
         actions.Controls.Add(_uninstallBtn, 1, 0);
         actions.Controls.Add(_enableRemoteBtn, 2, 0);
         actions.Controls.Add(_restartSvcBtn, 3, 0);
+        actions.Controls.Add(_restoreBtn, 4, 0);
         layout.Controls.Add(actions, 0, 0);
 
         // Deployment status
@@ -326,7 +330,8 @@ public partial class MainForm : Form
             ForeColor = Color.DimGray,
             Text = "说明：安装会将 rdpwrap.dll 与 rdpwrap.ini 部署到系统目录并注册到 TermService。\r\n" +
                    "安装和新增远程用户会自动启用 Windows 远程桌面；也可在本页手动启用。\r\n" +
-                   "若 INI 不支持当前系统版本，请到「自动分析」页：分析 → 添加到 INI（自动部署+重启）。\r\n" +
+                   "若 INI 不支持当前系统版本，请到「自动分析」页：分析 → 添加到 INI（自动部署+校验+失败自动回滚）。\r\n" +
+                   "「恢复到可用状态」会删除自动分析生成的版本 section 并重启服务，用于 RDP 连不上时快速恢复。\r\n" +
                    "所有安装/卸载过程的详细输出见「日志」页。"
         };
         layout.Controls.Add(hint, 0, 2);
@@ -555,6 +560,17 @@ public partial class MainForm : Form
 
         var svcStatus = ServiceManager.GetServiceStatus(ServiceManager.TermServiceName);
         sb.AppendLine($"TermService 状态: {svcStatus}");
+        // The service can be "Running" while termsrv failed to create its listener, so the
+        // listener state is what actually decides whether RDP works.
+        bool listening = ServiceManager.IsRdpPortListening();
+        sb.AppendLine($"3389 监听状态:    {(listening ? "正在侦听（远程桌面可用）" : "未侦听（远程桌面不可连接！）")}");
+        var tsEv = ServiceManager.GetTsStartupEvidence(DateTime.Now.AddMinutes(-15));
+        if (tsEv.StartupFailed)
+            sb.AppendLine($"  最近事件:      启动失败(17) {tsEv.StartupFailedAt:HH:mm:ss} → 请看日志页诊断");
+        else if (tsEv.ListenerStarted)
+            sb.AppendLine($"  最近事件:      侦听启动(258) {tsEv.ListenerStartedAt:HH:mm:ss}");
+        var rdpLog = DeployVerifier.FindRdpWrapLog();
+        sb.AppendLine($"rdpwrap 日志:    {(rdpLog ?? "(未找到，将部署时自动改为可写路径)")}");
         sb.AppendLine($"Windows 远程桌面: {(RDPWrapInstaller.IsRemoteDesktopEnabled() ? "已启用" : "未启用")}");
 
         var (supported, verStr) = _iniManager.CheckCurrentVersionSupport();
@@ -574,6 +590,7 @@ public partial class MainForm : Form
         sb.AppendLine($"ServiceDll:      {(_installer.InstalledDllPath ?? "(未检测到)")}");
         sb.AppendLine($"本地 INI:        {_iniManager.IniPath}");
         sb.AppendLine($"TermService:     {ServiceManager.GetServiceStatus(ServiceManager.TermServiceName)}");
+        sb.AppendLine($"3389 监听:       {(ServiceManager.IsRdpPortListening() ? "是" : "否")}");
         sb.AppendLine($"远程桌面开关:    {(RDPWrapInstaller.IsRemoteDesktopEnabled() ? "已启用" : "未启用")}");
         var (supported, verStr) = _iniManager.CheckCurrentVersionSupport();
         sb.AppendLine($"INI 支持 {verStr}: {(supported ? "是" : "否")}");
@@ -585,9 +602,18 @@ public partial class MainForm : Form
         _installBtn.Enabled = false;
         try
         {
+            var installStart = DateTime.Now;
             bool ok = _installer.Install();
-            if (!ok)
-                MessageBox.Show("RDPWrap 安装可能失败。请查看日志页的诊断信息。", "警告", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            bool ready = ok && ServiceManager.WaitServiceReady();
+            if (!ready)
+            {
+                var ev = ServiceManager.GetTsStartupEvidence(installStart.AddSeconds(-2));
+                AppendLog(_globalLog, $"[-] 安装后校验未通过: 3389 监听={ServiceManager.IsRdpPortListening()} " +
+                                      $"事件17={(ev.StartupFailed ? "有" : "无")}");
+                ServiceManager.DiagnoseTermServiceFailure();
+                MessageBox.Show("RDPWrap 安装未通过监听校验（3389 未就绪）。请查看日志页的诊断信息。",
+                    "警告", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
             RefreshStatus();
             RefreshInstallStatus();
         }
@@ -640,16 +666,23 @@ public partial class MainForm : Form
         try
         {
             AppendLog(_globalLog, "[*] 正在重启 TermService...");
+            var restartStart = DateTime.Now;
             bool started = ServiceManager.RestartService(ServiceManager.TermServiceName);
-            if (started)
+            bool ready = started && ServiceManager.WaitServiceReady();
+            if (ready)
             {
-                AppendLog(_globalLog, "[+] TermService 已重启.");
+                AppendLog(_globalLog, "[+] TermService 已重启，3389 正在侦听。");
             }
             else
             {
-                AppendLog(_globalLog, "[-] TermService 启动失败！正在诊断...");
+                AppendLog(_globalLog, "[-] TermService 未就绪（服务状态或 3389 监听异常）！正在诊断...");
                 ServiceManager.DiagnoseTermServiceFailure();
-                MessageBox.Show("TermService 启动失败！请查看日志页的诊断信息。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                var ev = ServiceManager.GetTsStartupEvidence(restartStart.AddSeconds(-2));
+                MessageBox.Show(
+                    "TermService 重启后未就绪：3389 未侦听或服务异常。\r\n" +
+                    (ev.StartupFailed ? $"检测到「远程桌面服务启动失败」(事件 17) {ev.StartupFailedAt:HH:mm:ss}。\r\n" : "") +
+                    "请查看日志页诊断信息；若是刚部署了自动分析配置，可点「恢复到可用状态」。",
+                    "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             RefreshStatus();
             RefreshInstallStatus();
@@ -905,40 +938,109 @@ public partial class MainForm : Form
         try
         {
             var (sectionContent, slInitContent) = _analyzer.BuildSectionBodies(_lastAnalysis);
-            bool added = _iniManager.AddVersionSections(_lastAnalysis.Aliases, sectionContent, slInitContent,
-                _analyzer.GetRequiredPatchCodes(_lastAnalysis));
+            var aliases = _lastAnalysis.Aliases;
+            var patchCodes = _analyzer.GetRequiredPatchCodes(_lastAnalysis);
 
-            if (!added)
-            {
-                MessageBox.Show("添加到 INI 失败，请查看日志。", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                return;
-            }
-
-            LoadIni();
-
-            // Auto-deploy to System32 and restart service
-            AppendLog(_globalLog, "\n[*] 正在部署到系统目录并重启服务...");
-            bool deployed = await Task.Run(() =>
+            AppendLog(_globalLog, "\n[*] 正在写入 INI、部署到系统目录、重启服务并校验监听状态...");
+            var result = await Task.Run(() =>
             {
                 _installer.CheckInstall();
                 if (_installer.IsInstalled)
-                    return _installer.DeployFilesOnly();
-                else
-                    return _installer.Install();
+                {
+                    return DeployWorkflow.DeployAnalyzedSection(
+                        _iniManager, _installer, aliases, sectionContent, slInitContent, patchCodes,
+                        msg => AppendLog(_globalLog, msg));
+                }
+                // Not installed yet: full install, then verify.
+                bool installed = _installer.Install();
+                if (!installed) return new DeployResult { Message = "安装失败。", Stage = "failed" };
+                return DeployVerifier.Verify(DateTime.Now.AddMinutes(-2), requirePatches: false,
+                    msg => AppendLog(_globalLog, msg));
             });
 
-            if (deployed)
-                MessageBox.Show($"版本 {string.Join(" / ", _lastAnalysis.Aliases)} 的 INI 配置已添加并部署到系统目录，\nTermService 已重启，补丁已生效！",
-                    "部署成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            else
-                MessageBox.Show("INI 配置已写入工具目录，但部署到 System32 失败。\n请查看「日志」页获取详细信息。",
-                    "部署失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-
+            LoadIni();
             RefreshStatus();
+
+            string summary =
+                $"阶段: {result.Stage}\r\n" +
+                $"监听 3389: {(result.PortListening ? "是" : "否")}\r\n" +
+                $"事件 258(侦听启动): {(result.ListenerEvent ? "有" : "无")}\r\n" +
+                $"事件 17(启动失败): {(result.StartupFailed ? "有" : "无")}\r\n" +
+                $"补丁日志: patches={(result.PatchesApplied ? "OK" : "-")} slInit={(result.SlInitWritten ? "OK" : "-")}\r\n" +
+                $"\r\n{result.Message}";
+
+            if (result.Success)
+            {
+                AppendLog(_globalLog, "[+] 部署成功并校验通过。");
+                MessageBox.Show($"版本 {string.Join(" / ", aliases)} 已部署并通过校验。\r\n\r\n{summary}",
+                    "部署成功", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                AppendLog(_globalLog, $"[-] 部署未通过校验：{result.Describe()}");
+                MessageBox.Show(
+                    $"部署未通过校验（未达到「远程桌面可用」状态）。\r\n\r\n{summary}\r\n\r\n" +
+                    "详细证据见「日志」页；完整分析报告见「自动分析」页。",
+                    "部署结果", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
         finally
         {
             _addToIniBtn.Enabled = true;
+        }
+    }
+
+    /// <summary>
+    /// Emergency recovery: drop every auto-generated version section, redeploy and verify
+    /// that the RDP listener comes back.
+    /// </summary>
+    private async void RestoreSafeState()
+    {
+        var aliases = _iniManager.GetGeneratedVersions();
+        var self = RDPWrapInstaller.GetTermsrvVersion();
+        if (self != null && !aliases.Contains(self.ToString())) aliases.Add(self.ToString());
+
+        var confirm = MessageBox.Show(
+            "将删除本工具自动分析生成的版本 section（含 -SLInit），重启 TermService 并校验 3389 监听是否恢复。\r\n" +
+            $"当前 termsrv.dll 版本: {(self?.ToString() ?? "未知")}\r\n" +
+            $"将移除: {(aliases.Count > 0 ? string.Join(" / ", aliases) : "(无)")}\r\n\r\n继续？",
+            "恢复到可用状态", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (confirm != DialogResult.Yes) return;
+
+        _restoreBtn.Enabled = false;
+        try
+        {
+            AppendLog(_globalLog, "\n[*] === 恢复到可用状态 ===");
+            var result = await Task.Run(() =>
+            {
+                _iniManager.BackupSystem32Ini();
+                if (aliases.Count > 0) _iniManager.RemoveVersionSections(aliases);
+                _installer.CheckInstall();
+                if (!_installer.IsInstalled)
+                    return new DeployResult { Message = "RDPWrap 未安装，无需恢复。", Stage = "failed" };
+                return _installer.DeployFilesOnly(verify: true, requirePatches: false);
+            });
+
+            LoadIni();
+            RefreshStatus();
+
+            if (result.PortListening)
+            {
+                MessageBox.Show(
+                    $"已移除自动生成的 section 并重启服务。\r\n\r\n监听 3389: 是\r\n" +
+                    "此时远程桌面应可正常连接（单会话）。若要再试多用户，请重新分析并部署（部署会自动校验与回滚）。",
+                    "恢复完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            else
+            {
+                MessageBox.Show(
+                    "恢复后 3389 仍未监听。\r\n请到「日志」页查看诊断信息，必要时点「卸载 RDPWrap」恢复到系统原生 termsrv.dll。",
+                    "恢复失败", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+        finally
+        {
+            _restoreBtn.Enabled = true;
         }
     }
 

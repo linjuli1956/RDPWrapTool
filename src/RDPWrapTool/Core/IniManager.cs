@@ -11,6 +11,22 @@ namespace RDPWrapTool.Core;
 /// </summary>
 public class IniManager
 {
+    /// <summary>
+    /// Log path written into [Main] LogFile before deploying. rdpwrap.dll runs inside
+    /// svchost as NETWORK SERVICE, so the root-relative "\rdpwrap.txt" used by the online
+    /// INI is not a place it can reliably create - and nothing ever looked there, which is
+    /// why the DLL's patch/readback diagnostics were invisible. This path is created and
+    /// ACL-granted by EnsureLogDirectory().
+    /// </summary>
+    public const string DefaultLogPath = @"C:\ProgramData\RDPWrapTool\rdpwrap.txt";
+
+    /// <summary>Comment line emitted in front of the generated alias sections.</summary>
+    public const string AliasComment = "; alias section - same binary, alternate version resource value";
+
+    /// <summary>The INI that rdpwrap.dll actually loads.</summary>
+    public static string System32IniPath =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "rdpwrap.ini");
+
     /// <summary>Known patch code hex payloads. Auto-added to [PatchCodes] when a generated section needs them.</summary>
     public static readonly Dictionary<string, string> KnownPatchCodes = new()
     {
@@ -29,6 +45,13 @@ public class IniManager
     private string _iniPath;
 
     public string IniPath => _iniPath;
+
+    /// <summary>
+    /// Manifest of the version sections this tool generated (one name per line). It lets
+    /// "restore" remove exactly what we added instead of guessing from version numbers and
+    /// accidentally deleting community-verified sections.
+    /// </summary>
+    public string GeneratedManifestPath => Path.Combine(_toolDir, "rdpwrap.generated.txt");
 
     public event Action<string>? OnLog;
     private void Log(string msg) => OnLog?.Invoke(msg);
@@ -219,7 +242,7 @@ public class IniManager
             {
                 sb.AppendLine();
                 if (i > 0)
-                    sb.AppendLine("; alias section - same binary, alternate version resource value");
+                    sb.AppendLine(AliasComment);
                 sb.AppendLine($"[{aliases[i]}]");
                 sb.AppendLine(sectionContent.TrimEnd());
                 if (!string.IsNullOrEmpty(slInitContent))
@@ -230,11 +253,236 @@ public class IniManager
                 }
             }
 
-            return SaveText(sb.ToString());
+            bool ok = SaveText(sb.ToString());
+            if (ok) TrackGeneratedSections(aliases, add: true);
+            return ok;
         }
         catch (Exception ex)
         {
             Log($"[-] AddVersionSections error: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>Record generated section names in the manifest (best effort).</summary>
+    private void TrackGeneratedSections(IEnumerable<string> aliases, bool add)
+    {
+        try
+        {
+            var names = GetGeneratedVersions();
+            foreach (var a in aliases)
+            {
+                if (add) { if (!names.Contains(a)) names.Add(a); }
+                else names.RemoveAll(n => n.Equals(a, StringComparison.OrdinalIgnoreCase));
+            }
+            File.WriteAllLines(GeneratedManifestPath, names, new UTF8Encoding(false));
+        }
+        catch (Exception ex)
+        {
+            Log($"[!] 记录生成清单失败（不影响部署）: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Find other version sections whose body is byte-identical to the body of 'version'
+    /// (plus matching -SLInit body). These are the alias sections written by the generator
+    /// for builds whose version resource disagrees with the file version string.
+    /// </summary>
+    private static List<string> FindTwinVersionSections(string text, string version)
+    {
+        var twins = new List<string>();
+        try
+        {
+            string? body = GetSectionBody(text, version);
+            if (body == null) return twins;
+
+            var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            foreach (var line in lines)
+            {
+                string t = line.Trim();
+                if (!t.StartsWith("[") || !t.EndsWith("]")) continue;
+                string name = t.Substring(1, t.Length - 2);
+                if (name.Equals(version, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^\d+\.\d+\.\d+\.\d+$")) continue;
+                if (GetSectionBody(text, name) == body) twins.Add(name);
+            }
+        }
+        catch { }
+        return twins;
+    }
+
+    /// <summary>Body of a section (lines after the header up to the next header), or null.</summary>
+    private static string? GetSectionBody(string text, string section)
+    {
+        var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+        var sb = new StringBuilder();
+        bool inSection = false, found = false;
+        foreach (var line in lines)
+        {
+            string t = line.Trim();
+            bool isHeader = t.StartsWith("[") && t.EndsWith("]");
+            if (isHeader)
+            {
+                if (inSection) break;
+                inSection = t.Equals($"[{section}]", StringComparison.OrdinalIgnoreCase);
+                if (inSection) found = true;
+                continue;
+            }
+            if (inSection) sb.AppendLine(line.Trim());
+        }
+        return found ? sb.ToString() : null;
+    }
+
+    /// <summary>Version sections previously generated by this tool.</summary>
+    public List<string> GetGeneratedVersions()
+    {
+        try
+        {
+            if (!File.Exists(GeneratedManifestPath)) return new List<string>();
+            var fromManifest = File.ReadAllLines(GeneratedManifestPath)
+                .Select(l => l.Trim())
+                .Where(l => l.Length > 0 && !l.StartsWith(";"))
+                .ToList();
+            // keep only names that still exist in the INI
+            var text = LoadText();
+            return fromManifest
+                .Where(n => text.IndexOf($"[{n}]", StringComparison.OrdinalIgnoreCase) >= 0)
+                .ToList();
+        }
+        catch
+        {
+            return new List<string>();
+        }
+    }
+
+    /// <summary>
+    /// Remove the version sections (plus their -SLInit pairs) that auto-analysis added.
+    /// Used for one-click restore and by the deploy rollback path.
+    /// </summary>
+    public bool RemoveVersionSections(IReadOnlyList<string> aliases)
+    {
+        try
+        {
+            var text = LoadText();
+            if (string.IsNullOrEmpty(text)) return false;
+
+            // Expand the removal set with alias twins (same body, alternate version name) so
+            // sections generated before the manifest existed are cleaned up as well.
+            var targets = new List<string>();
+            foreach (var name in aliases)
+            {
+                if (!targets.Contains(name, StringComparer.OrdinalIgnoreCase)) targets.Add(name);
+                foreach (var twin in FindTwinVersionSections(text, name))
+                    if (!targets.Contains(twin, StringComparer.OrdinalIgnoreCase)) targets.Add(twin);
+            }
+
+            foreach (var name in targets)
+            {
+                text = RemoveSection(text, name);
+                text = RemoveSection(text, $"{name}-SLInit");
+            }
+            // drop orphaned alias comments
+            var kept = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
+                           .Where(l => !l.Trim().Equals(AliasComment, StringComparison.OrdinalIgnoreCase));
+            bool ok = SaveText(string.Join("\r\n", kept));
+            if (ok) TrackGeneratedSections(aliases, add: false);
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            Log($"[-] RemoveVersionSections error: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Back up the deployed System32 INI (the file rdpwrap.dll reads) into the tool data
+    /// directory before it is overwritten. Returns the backup path, or null on failure.
+    /// </summary>
+    public string? BackupSystem32Ini()
+    {
+        try
+        {
+            string src = System32IniPath;
+            if (!File.Exists(src))
+            {
+                Log("[*] 系统目录暂无 rdpwrap.ini，跳过备份。");
+                return null;
+            }
+            string dst = Path.Combine(_toolDir, $"rdpwrap.ini.bak.{DateTime.Now:yyyyMMddHHmmss}");
+            File.Copy(src, dst, true);
+            Log($"[+] 已备份系统 INI: {dst}");
+            return dst;
+        }
+        catch (Exception ex)
+        {
+            Log($"[-] 备份系统 INI 失败: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Make [Main] LogFile point at a path the RDP service account can actually write,
+    /// so that rdpwrap.dll's diagnostics (patch bytes, readback, SLInit writes) land
+    /// somewhere the tool can read.
+    /// </summary>
+    public static string EnsureWritableLogPath(string text, string logPath = DefaultLogPath)
+    {
+        var lines = NormalizeCrlf(text).Split(new[] { "\r\n" }, StringSplitOptions.None).ToList();
+        int mainIdx = lines.FindIndex(l => l.Trim().Equals("[Main]", StringComparison.OrdinalIgnoreCase));
+
+        if (mainIdx < 0)
+        {
+            lines.Insert(0, "[Main]");
+            lines.Insert(1, $"LogFile={logPath}");
+            lines.Insert(2, "");
+            return string.Join("\r\n", lines);
+        }
+
+        int nextSection = lines.FindIndex(mainIdx + 1, l =>
+            l.TrimStart().StartsWith("[") && l.TrimEnd().EndsWith("]"));
+        int end = nextSection < 0 ? lines.Count : nextSection;
+
+        for (int i = mainIdx + 1; i < end; i++)
+        {
+            if (lines[i].TrimStart().StartsWith("LogFile", StringComparison.OrdinalIgnoreCase) &&
+                lines[i].Contains('='))
+            {
+                lines[i] = $"LogFile={logPath}";
+                return string.Join("\r\n", lines);
+            }
+        }
+        lines.Insert(mainIdx + 1, $"LogFile={logPath}");
+        return string.Join("\r\n", lines);
+    }
+
+    /// <summary>
+    /// Create the directory holding <see cref="DefaultLogPath"/> and grant the RDP service
+    /// account (NETWORK SERVICE, which hosts TermService in svchost) write access.
+    /// </summary>
+    public static bool EnsureLogDirectory(string logPath = DefaultLogPath)
+    {
+        try
+        {
+            string? dir = Path.GetDirectoryName(logPath);
+            if (string.IsNullOrEmpty(dir)) return false;
+            Directory.CreateDirectory(dir);
+
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "icacls.exe",
+                Arguments = $"\"{dir}\" /grant \"NETWORK SERVICE:(OI)(CI)M\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+            var p = System.Diagnostics.Process.Start(psi);
+            p?.WaitForExit(10000);
+            return p?.ExitCode == 0;
+        }
+        catch
+        {
             return false;
         }
     }
