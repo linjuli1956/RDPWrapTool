@@ -12,6 +12,12 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>RDPWrapTool</AssemblyName>
     <RootNamespace>RDPWrapTool</RootNamespace>
+    <!-- Release version: shown in the exe's file properties -->
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
+    <Product>RDPWrapTool</Product>
+    <Description>RDP Wrapper manager, auto-analyzer and deployer for Windows 10/11 x64</Description>
   </PropertyGroup>
 
   <ItemGroup>
